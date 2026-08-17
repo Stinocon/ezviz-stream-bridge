@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import shutil
 import signal
 import subprocess
 import sys
@@ -74,11 +73,13 @@ class Supervisor:
         config: BridgeConfig,
         token_store: TokenStore,
         *,
-        executable: str = "pyezvizapi",
+        executable: str = sys.executable,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._config = config
         self._tokens = token_store
+        # The proxy runs as `python -m ezviz_stream_bridge.proxy`, so the executable is
+        # this interpreter. Kept injectable for tests.
         self._executable = executable
         self._now = monotonic  # injected so tests do not have to sleep
         self._proxies = [_Proxy(camera=camera) for camera in config.cameras]
@@ -87,17 +88,16 @@ class Supervisor:
 
     def run(self) -> int:
         """Supervise until a signal asks for shutdown. Returns a process exit code."""
-        if shutil.which(self._executable) is None:
-            _LOGGER.error(
-                "%s is not on PATH: the image is built wrong.", self._executable
-            )
-            return 1
-
         self._install_signal_handlers()
 
+        # A consumer reaches the stream at the Home Assistant host IP on the port the
+        # add-on publishes in its Network tab -- NOT at an add-on hostname. An earlier
+        # version advertised `local-ezviz_stream_bridge`, which does not resolve from a
+        # store-installed add-on's container (go2rtc failed with "no such host"); the
+        # host IP + mapped port is what actually works.
         _LOGGER.info(
-            "Serving %d camera(s). Other add-ons reach them at "
-            "http://local-ezviz_stream_bridge:<port>/<serial>.ts",
+            "Serving %d camera(s). Map each port in the add-on's Network tab, then use "
+            "http://<home-assistant-ip>:<port>/<serial>.ts",
             len(self._proxies),
         )
         for proxy in self._proxies:
@@ -211,19 +211,21 @@ class Supervisor:
 
         command = [
             self._executable,
-            "--token-file",
-            str(self._tokens.path),
-            "stream",
-            "proxy",
+            "-m",
+            "ezviz_stream_bridge.proxy",
             "--serial",
             proxy.camera.serial,
             # 0.0.0.0 because the consumer -- go2rtc in another container -- connects
             # from outside this one. Nothing is published to the LAN unless the user
-            # maps the port in the add-on configuration.
-            "--listen-host",
-            "0.0.0.0",  # noqa: S104 - see above: cross-container by design, unmapped by default
-            "--listen-port",
+            # maps the port in the add-on's Network tab.
+            "--host",
+            "0.0.0.0",  # noqa: S104 - cross-container by design, unmapped by default
+            "--port",
             str(proxy.camera.port),
+            "--token-file",
+            str(self._tokens.path),
+            "--region",
+            self._config.region,
         ]
 
         try:

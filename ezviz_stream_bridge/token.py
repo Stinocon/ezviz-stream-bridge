@@ -31,6 +31,22 @@ from pyezvizapi.exceptions import (
 _LOGGER = logging.getLogger(__name__)
 
 
+def read_token_file(path: Path) -> dict[str, Any] | None:
+    """Return a stored token that at least carries a session, or None.
+
+    Shared by the supervisor (to reuse a session) and the proxy subprocess (to build
+    its client without a password), so the "what counts as a usable token" rule lives
+    in one place.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(data, dict) and data.get("session_id"):
+        return data
+    return None
+
+
 class MfaRequiredError(Exception):
     """The account asks for a verification code, which an add-on cannot answer.
 
