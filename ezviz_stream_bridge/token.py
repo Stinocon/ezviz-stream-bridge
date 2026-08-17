@@ -31,12 +31,35 @@ from pyezvizapi.exceptions import (
 _LOGGER = logging.getLogger(__name__)
 
 
-class MfaRequired(Exception):
+class MfaRequiredError(Exception):
     """The account asks for a verification code, which an add-on cannot answer.
 
     Raised as its own type because it is the one failure the user has to act on
     rather than wait out, and the remedy is different from every other login error.
     """
+
+
+# Only these mean "this session is no longer valid". Every other HTTP status is the
+# cloud having a bad moment, and must not be mistaken for one.
+_UNAUTHENTICATED_STATUS = frozenset({401, 403})
+
+
+def _http_status(err: BaseException) -> int | None:
+    """Dig the HTTP status out of a pyezvizapi error, if it carries one.
+
+    `pyezvizapi` re-raises its own `HTTPError` `from` the underlying requests error,
+    so the status lives on the cause rather than on what we caught.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = err
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        response = getattr(current, "response", None)
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int):
+            return status
+        current = current.__cause__
+    return None
 
 
 class TokenStore:
@@ -101,12 +124,24 @@ class TokenStore:
         client = EzvizClient(token=dict(token), url=self._region)
         try:
             client.get_device_infos()
-        except (EzvizAuthTokenExpired, HTTPError):
+        except EzvizAuthTokenExpired:
             return False
+        except HTTPError as err:
+            # Not every HTTP error means the session died. A 500 or a 502 from the
+            # cloud would otherwise be read as an expired token, and each misreading
+            # spends a real login -- which EZVIZ rate-limits, so a bad afternoon at
+            # their end would turn into being locked out at ours.
+            status = _http_status(err)
+            if status in _UNAUTHENTICATED_STATUS:
+                return False
+            _LOGGER.warning(
+                "Token check got HTTP %s, which does not mean the session is dead: keeping it.",
+                status if status is not None else "error",
+            )
+            return True
         except PyEzvizError as err:
-            # Anything else -- the cloud being briefly unhappy, a network blip -- is
-            # not evidence that the token is bad. Logging in again on every such
-            # error would burn logins during an outage, and EZVIZ rate-limits those.
+            # Same reasoning for the non-HTTP failures: a network blip is not evidence
+            # that the token is bad.
             _LOGGER.warning("Could not verify the stored token (%s): keeping it.", err)
             return True
         else:
@@ -118,7 +153,7 @@ class TokenStore:
         try:
             client.login()
         except EzvizAuthVerificationCode as err:
-            raise MfaRequired(
+            raise MfaRequiredError(
                 "the EZVIZ account asked for a verification code. An add-on cannot "
                 "type one in, so either turn off two-factor authentication for this "
                 "account, or log in once with `pyezvizapi -u ... -p ... --save-token "

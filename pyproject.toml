@@ -38,7 +38,15 @@ target-version = "py312"
 select = ["E", "F", "W", "I", "N", "UP", "B", "S", "C4", "RET", "SIM", "PL"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101"]
+# Asserts are the point of a test, and an HTTP status is clearer written as 401 than
+# named at the top of the file and dereferenced at the assertion.
+"tests/*" = ["S101", "PLR2004"]
+# The probes are single-purpose diagnostic scripts, and the numbers in them are wire
+# constants: EtherType 0x8d8d, the printable-ASCII range, the Ethernet header length.
+# Naming each one moves it away from the parsing step that gives it meaning, which for
+# protocol code costs more readability than it buys. They also bind a listening socket
+# to receive broadcast replies, which is the point of a discovery probe.
+"tools/*" = ["PLR2004", "PLR0912", "PLR0915", "S104"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

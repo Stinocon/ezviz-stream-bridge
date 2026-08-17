@@ -28,15 +28,31 @@ If you want a doorbell that survives a dead line, no software gets you there —
 hardware with a native local interface. [`docs/investigation.md`](docs/investigation.md) is the
 full measured account of why, so nobody has to repeat the work.
 
-## Battery cameras
+## Before it can work: two EZVIZ app settings
 
-Every HTTP client that connects opens a new cloud session and wakes the camera, so a consumer
-that stays connected never lets it sleep. On a battery model that turns months of standby into
-days.
+- **Two-step verification off** on the EZVIZ account. Nothing here can type a code in. (Home
+  Assistant's own EZVIZ integration requires the same, and rejects OAuth accounts too.) The way
+  round it is to log in by hand once and place the token file yourself; renewal is automatic
+  from there.
+- **Video encryption off** for the camera. Encrypted video needs the camera's media key, and
+  the cloud only releases it to a rights-elevated session — the request returns
+  `resultCode 20002` and emails a code, which again nobody is there to read.
 
-Treat the stream as **on-demand**, and leave Frigate's `detect` and `record` off. Continuous
-detection on a battery doorbell is not a setting to tune — it is something the hardware cannot
-do.
+The camera's six-letter verification code is **not** needed and is not the account password.
+
+## Battery cameras, detect and record
+
+Every connection opens a cloud session and makes the camera encode and upload, so an always-on
+consumer means an always-encoding camera — hours of battery on a doorbell, not months.
+
+That does not mean Frigate's `detect` and `record` are useless here: it means they must be
+**event-gated**, switched on via `frigate/<camera>/detect/set` when the doorbell event arrives
+and off again after. Measured through this bridge: **~4.3 s to first byte, first keyframe 1.4 s
+in**, so about six seconds from request to a decodable frame, with keyframes every 4 s.
+Recording starts mid-scene by construction.
+
+The full account, with the Frigate configuration, is in the
+[add-on README](https://github.com/Stinocon/addons/tree/master/ezviz-stream-bridge).
 
 ## How it works
 

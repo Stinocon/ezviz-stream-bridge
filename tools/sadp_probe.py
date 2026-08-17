@@ -9,6 +9,7 @@ query, and the UDP signaling probe only sends a short opaque payload.
 
 from __future__ import annotations
 
+import contextlib
 import socket
 import struct
 import sys
@@ -21,10 +22,10 @@ SADP_GROUP = "239.255.255.250"
 SADP_PORT = 37020
 
 SADP_INQUIRY = (
-    '<?xml version="1.0" encoding="utf-8"?>'
-    "<Probe><Uuid>0FA1BE00-0000-0000-0000-000000000000</Uuid>"
-    "<Types>inquiry</Types></Probe>"
-).encode()
+    b'<?xml version="1.0" encoding="utf-8"?>'
+    b"<Probe><Uuid>0FA1BE00-0000-0000-0000-000000000000</Uuid>"
+    b"<Types>inquiry</Types></Probe>"
+)
 
 
 def _bind_socket() -> socket.socket:
@@ -50,15 +51,15 @@ def sadp_discovery(rounds: int = 6) -> None:
     seen: dict[str, bytes] = {}
     for _ in range(rounds):
         for dest in (SADP_GROUP, TARGET, "255.255.255.255"):
-            try:
+            # A destination this host has no route to is expected: all three are tried
+            # precisely because it is not known which one the device answers on.
+            with contextlib.suppress(OSError):
                 sock.sendto(SADP_INQUIRY, (dest, SADP_PORT))
-            except OSError:
-                pass
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             try:
                 data, addr = sock.recvfrom(8192)
-            except socket.timeout:
+            except TimeoutError:
                 break
             except OSError:
                 break
@@ -90,7 +91,7 @@ def udp_signaling_probe() -> None:
             sock.sendto(b"\x00\x00\x00\x01", (TARGET, port))
             data, _ = sock.recvfrom(4096)
             print(f"UDP {port}: REPLY {len(data)} bytes: {data[:80].hex()}")
-        except socket.timeout:
+        except TimeoutError:
             print(f"UDP {port}: no reply (open|filtered — normal for UDP)")
         except OSError as err:
             print(f"UDP {port}: {err.strerror} (ICMP port-unreachable => closed)")

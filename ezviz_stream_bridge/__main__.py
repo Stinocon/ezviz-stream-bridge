@@ -6,7 +6,7 @@ import argparse
 import logging
 from pathlib import Path
 
-from .config import ConfigError, BridgeConfig, load_options
+from .config import BridgeConfig, ConfigError, load_options
 from .supervisor import Supervisor, configure_logging
 from .token import TokenStore
 

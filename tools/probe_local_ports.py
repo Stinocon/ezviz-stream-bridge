@@ -42,7 +42,7 @@ def probe_tcp(host: str, port: int) -> str:
     sock.settimeout(TCP_TIMEOUT)
     try:
         sock.connect((host, port))
-    except socket.timeout:
+    except TimeoutError:
         return "filt"
     except OSError as err:
         if err.errno == errno.ECONNREFUSED:
@@ -61,7 +61,7 @@ def probe_udp(host: str, port: int) -> tuple[str, bytes | None]:
     try:
         sock.sendto(b"\x00\x00\x00\x00\x00\x00\x00\x00", (host, port))
         data, _ = sock.recvfrom(4096)
-    except socket.timeout:
+    except TimeoutError:
         return "sil.", None
     except OSError as err:
         if err.errno in (errno.ECONNREFUSED, errno.EHOSTUNREACH):
@@ -78,8 +78,11 @@ def main() -> int:
     print(f"Probing {HOST} for {DURATION:.0f}s")
     print("TCP:  OPEN=listening  clsd=RST(awake)  filt=silent(asleep)")
     print("UDP:  RPLY=answered   clsd=ICMP unreachable  sil.=silent")
-    print(f"UDP {UDP_CONTROL} is the control: it must read 'clsd' for the UDP column to mean anything.")
-    print("\n--> Open the CP4 live view in the EZVIZ app NOW, and keep it open <--\n")
+    print(
+        f"UDP {UDP_CONTROL} is the control: it must read 'clsd' for the UDP "
+        "column to mean anything."
+    )
+    print("\n--> Open the camera's live view in the EZVIZ app NOW, and keep it open <--\n")
 
     header = (
         "time      | "
