@@ -94,9 +94,12 @@ ezviz-stream-bridge --options ./options.json --token-file ./ezviz_token.json
 }
 ```
 
-`serial` is the device serial from the label, **not** the six-letter verification code printed
-on the camera. `region` is `apiieu` for Europe, `apius` for the Americas, `apiisgp` for
-Singapore; the wrong one looks exactly like a wrong password.
+`serial` is the device serial, **not** the six-letter verification code printed on the camera.
+The easiest way to find it is to fill in the credentials, leave `serial` empty and start once:
+the run fails, and the log then lists every camera on the account with its serial. It is also in
+the EZVIZ app under *Settings → Device Information*, and on the device label near the QR code.
+`region` is `apiieu` for Europe, `apius` for the Americas, `apiisgp` for Singapore; the wrong
+one looks exactly like a wrong password.
 
 ## Investigation tools
 
