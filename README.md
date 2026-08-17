@@ -57,16 +57,25 @@ The full account, with the Frigate configuration, is in the
 ## How it works
 
 ```
-EZVIZ camera ──► EZVIZ cloud (VTM relay) ──► pyezvizapi ──► MPEG-TS over HTTP ──► go2rtc ──► Frigate
-                                                  ▲
-                                         this repo: session + supervision
+EZVIZ camera ─► EZVIZ cloud (VTM relay) ─► in-process proxy ─► MPEG-TS over HTTP ─► go2rtc ─► Frigate
+                                              ▲   (pyezvizapi VTM + remux)
+                                    this repo: session, supervision, per-connection logging
 ```
 
-The protocol work is all [pyezvizapi](https://github.com/RenierM26/pyEzvizApi). This project is
-the part that has to keep working for weeks unattended:
+Consumers reach the stream at the Home Assistant host IP on the mapped port
+(`http://<ha-ip>:8558/<serial>.ts`), not at an add-on hostname — see the
+[add-on README](https://github.com/Stinocon/addons/tree/master/ezviz-stream-bridge).
+
+The VTM session and the remux are all [pyezvizapi](https://github.com/RenierM26/pyEzvizApi).
+This project is the part that has to keep working for weeks unattended:
 
 - **One supervised proxy per camera**, restarted with a growing, capped delay. A camera that
   cannot work — a serial that is not on the account — backs off instead of looping.
+- **On-demand by construction, and instrumented.** The proxy runs in-process, so every HTTP
+  connection is logged with an id, source address and User-Agent, and one VTM session opens per
+  connection and closes the instant the client disconnects. No client, no VTM, no camera drain;
+  the bridge never generates a request of its own, so an `active` count that will not return to
+  0 points straight at the external consumer holding it open.
 - **Session handling in one place.** The token is verified before every proxy start and renewed
   when the cloud stops accepting it. It is kept on `/data`, because a fresh login on every
   start is a login EZVIZ counts and rate-limits.
