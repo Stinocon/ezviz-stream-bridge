@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ezviz-stream-bridge"
-version = "0.1.0"
+version = "0.1.1"
 description = "Serve EZVIZ camera video as local MPEG-TS for go2rtc, Frigate and Home Assistant"
 readme = "README.md"
 requires-python = ">=3.12"
