@@ -9,17 +9,19 @@ would fill the add-on log and keep waking the camera.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import shutil
 import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import FrameType
 
 from .config import BridgeConfig, CameraConfig
-from .token import MfaRequired, TokenStore
+from .token import MfaRequiredError, TokenStore
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -36,6 +38,8 @@ POLL_INTERVAL = 1.0
 # How long a proxy gets to exit on its own after SIGTERM before it is killed. The
 # proxy has an FFmpeg child to tear down, so this is not instant.
 SHUTDOWN_GRACE = 10.0
+# After SIGKILL, only long enough to reap the child. A killed process cannot refuse.
+SHUTDOWN_KILL_GRACE = 2.0
 
 
 @dataclass
@@ -71,7 +75,7 @@ class Supervisor:
         token_store: TokenStore,
         *,
         executable: str = "pyezvizapi",
-        monotonic: object = time.monotonic,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._config = config
         self._tokens = token_store
@@ -135,8 +139,9 @@ class Supervisor:
             if proxy.running:
                 continue
 
-            if proxy.process is not None:
-                self._note_exit(proxy)
+            exited = proxy.process
+            if exited is not None:
+                self._note_exit(proxy, exited)
 
             now = self._clock()
             if now < proxy.next_attempt_at:
@@ -151,10 +156,15 @@ class Supervisor:
 
             self._start(proxy)
 
-    def _note_exit(self, proxy: _Proxy) -> None:
-        """Account for a proxy that has stopped, and schedule the retry."""
-        assert proxy.process is not None
-        code = proxy.process.returncode
+    def _note_exit(self, proxy: _Proxy, exited: subprocess.Popen[bytes]) -> None:
+        """Account for a proxy that has stopped, and schedule the retry.
+
+        The finished process is passed in rather than read back off `proxy`, so the
+        type is known without an `assert` -- which `python -O` strips, leaving the
+        attribute access unguarded in exactly the build where a mistake is hardest
+        to see.
+        """
+        code = exited.returncode
         uptime = self._clock() - proxy.started_at
 
         if uptime >= HEALTHY_AFTER:
@@ -179,7 +189,7 @@ class Supervisor:
         """Refresh the token if needed, then start this camera's proxy."""
         try:
             self._tokens.ensure()
-        except MfaRequired as err:
+        except MfaRequiredError as err:
             # Retrying cannot help: nothing in here can supply a verification code.
             # Stopping makes the add-on show as failed, which is the honest state and
             # the only one that gets the user to read the log.
@@ -211,7 +221,7 @@ class Supervisor:
             # from outside this one. Nothing is published to the LAN unless the user
             # maps the port in the add-on configuration.
             "--listen-host",
-            "0.0.0.0",
+            "0.0.0.0",  # noqa: S104 - see above: cross-container by design, unmapped by default
             "--listen-port",
             str(proxy.camera.port),
         ]
@@ -245,32 +255,43 @@ class Supervisor:
 
     def _shutdown(self) -> None:
         """Stop every proxy, escalating to SIGKILL only if one will not go."""
-        running = [proxy for proxy in self._proxies if proxy.running]
+        # Paired up front so the type is known without an `assert` per loop, and so a
+        # process replaced mid-shutdown cannot make the second loop wait on a different
+        # one than the first loop signalled.
+        running = [
+            (proxy, proxy.process)
+            for proxy in self._proxies
+            if proxy.running and proxy.process is not None
+        ]
         if not running:
             return
 
-        for proxy in running:
-            assert proxy.process is not None
-            proxy.process.terminate()
+        for _, process in running:
+            process.terminate()
 
+        # One shared deadline rather than one each: SHUTDOWN_GRACE is how long the add-on
+        # may take to stop in total, and s6 will not wait per-camera.
         deadline = self._clock() + SHUTDOWN_GRACE
-        for proxy in running:
-            assert proxy.process is not None
+        for proxy, process in running:
             remaining = max(0.0, deadline - self._clock())
             try:
-                proxy.process.wait(timeout=remaining)
+                process.wait(timeout=remaining)
             except subprocess.TimeoutExpired:
                 _LOGGER.warning(
                     "Camera %s: proxy did not stop in time; killing it.",
                     proxy.camera.serial,
                 )
-                proxy.process.kill()
+                process.kill()
+                # Reap it, or the killed child stays a zombie for as long as this
+                # process lives -- which, on a failed shutdown, may be a while.
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=SHUTDOWN_KILL_GRACE)
 
         _LOGGER.info("All proxies stopped.")
 
     def _clock(self) -> float:
         """Monotonic seconds, injectable for tests."""
-        return float(self._now())  # type: ignore[operator]
+        return self._now()
 
 
 def configure_logging(level: str) -> None:
