@@ -132,6 +132,33 @@ The cheap way to make progress here is not reverse engineering but observation: 
 EZVIZ chime on the same LAN would produce a complete `req`/`rep` exchange to read.
 `tools/analyze_l2_frames.py` parses these frames from a capture.
 
+## Finding 6: the live stream is not peer-to-peer on the LAN either
+
+The last hope for a cloud-free path was that the app and the camera might hole-punch a direct
+P2P connection and stream over the LAN, with the cloud only brokering the introduction. If so,
+the video bytes would already be local — just invisible to a third host on Wi-Fi.
+
+ARP settles it without needing to see the video. Two hosts about to exchange unicast IP must
+first resolve each other's MAC, and ARP requests are broadcast, so a laptop on the same Wi-Fi
+sees them even though it cannot see the unicast data that follows. Capture ARP while a phone
+shows the live view; the phone's ARP cache is cold toward the camera, so if it talks to the
+camera directly it is forced to resolve it.
+
+Result, over a 72-second live view opened on the phone:
+
+- **No station ever resolved the camera.** The only `who-has <camera>` was the camera's own
+  gratuitous ARP. The phone, while displaying live video, never resolved the camera — so it was
+  not receiving that video from the camera over the LAN.
+- **The camera resolved only the gateway**, and re-resolved it every ~5 seconds for the whole
+  window — the signature of a device continuously sending packets toward the internet.
+
+So the path is `camera → gateway → internet → cloud → phone`. There is no LAN-local leg in
+either direction. This also retires the "fake the cloud with a MITM" idea: there is no local
+video traffic to intercept, and what does leave is TLS to the cloud, encrypted under keys the
+camera derives from a secret in its firmware.
+
+`tools/p2p_arp_analyze.py` runs this analysis on a capture and auto-detects the gateway.
+
 ## What does work
 
 The EZVIZ cloud VTM relay, which is what the app itself uses. Verified end to end:
@@ -187,19 +214,27 @@ real port stays silent, that silence is evidence the port is open. On this devic
 port stayed silent too, so the whole UDP column is uninterpretable — and the tool reports it as
 inconclusive rather than letting the reader mistake silence for a finding.
 
-**Wi-Fi limits passive capture.** You cannot see another station's unicast traffic without
-monitor mode; the AP does not relay it. A capture from a laptop shows only broadcast and
-multicast — enough for Finding 5, not enough to observe the camera's cloud traffic. That needs
-a mirrored switch port or the camera on wire.
+**Wi-Fi limits passive capture — but ARP slips through.** You cannot see another station's
+unicast traffic without monitor mode; the AP does not relay it. So the video flow itself is
+invisible from a third host. But ARP requests are broadcast, and that is enough to answer
+whether two hosts are about to talk directly (Finding 6) without seeing a single video byte.
+To observe the camera's actual cloud traffic you would still need a mirrored switch port or the
+camera on wire — and this camera is Wi-Fi only, so that avenue is closed here.
+
+**Run the P2P test from the phone, not the laptop.** The laptop has been talking to the camera
+all day, so its ARP cache is warm and it will not re-resolve — a cache hit reads as silence.
+The phone's cache is cold, so a direct talk forces a visible resolution. Running it from the
+laptop makes the result inconclusive; from the phone it is definitive.
 
 ## Tools
 
 Run against your own device only.
 
 ```bash
-python3 tools/probe_local_ports.py <camera-ip> 120   # TCP/UDP state while awake
-python3 tools/sadp_probe.py <camera-ip>              # SADP discovery + UDP signaling
-python3 tools/analyze_l2_frames.py <capture.pcap>    # parse the 0x8d8d frames
+python3 tools/probe_local_ports.py <camera-ip> 120        # TCP/UDP state while awake
+python3 tools/sadp_probe.py <camera-ip>                   # SADP discovery + UDP signaling
+python3 tools/analyze_l2_frames.py <capture.pcap>         # parse the 0x8d8d frames
+python3 tools/p2p_arp_analyze.py <capture.pcap> <mac> <ip>  # local P2P vs cloud (Finding 6)
 ```
 
 For the capture behind the third one, filter on the camera's MAC rather than its IP — the
