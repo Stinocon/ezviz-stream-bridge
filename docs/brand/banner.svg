@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 260" role="img"
+     aria-label="EZVIZ Stream Bridge — EZVIZ camera video as MPEG-TS for go2rtc and Frigate">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1f2b"/>
+      <stop offset="1" stop-color="#123246"/>
+    </linearGradient>
+    <!-- Same Home Assistant blue as the add-on repository's banner: this is one of those
+         add-ons, and the tile should place it there before the words do. -->
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#41bdf5"/>
+      <stop offset="1" stop-color="#1a7fae"/>
+    </linearGradient>
+    <linearGradient id="word" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#f2fbff"/>
+      <stop offset="1" stop-color="#8fd6f5"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#41bdf5" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#41bdf5" stop-opacity="0"/>
+    </radialGradient>
+    <!-- The warm light behind the lens: what a door viewer actually looks at is a lit
+         landing, and it is the one non-blue thing on the banner. -->
+    <radialGradient id="lit" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#ffd9b0" stop-opacity="0.62"/>
+      <stop offset="1" stop-color="#ffd9b0" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="edge">
+      <rect width="1200" height="260" rx="20"/>
+    </clipPath>
+  </defs>
+
+  <rect width="1200" height="260" rx="20" fill="url(#bg)"/>
+
+  <g clip-path="url(#edge)">
+    <ellipse cx="1000" cy="50" rx="380" ry="230" fill="url(#glow)"/>
+
+    <!-- The stream, drawn as transport packets getting smaller as they travel right: the
+         video leaves the camera and goes somewhere else to be consumed. They shrink rather
+         than fade because this is a copy-only remux — nothing is lost on the way, it is just
+         further from the source. -->
+    <g fill="none" stroke="#7fd3f5" opacity="0.11">
+      <rect x="880" y="150" width="54" height="54" rx="14"/>
+      <rect x="962" y="112" width="42" height="42" rx="11"/>
+      <rect x="1030" y="168" width="34" height="34" rx="9"/>
+      <rect x="1092" y="86" width="26" height="26" rx="7"/>
+    </g>
+  </g>
+
+  <!-- The mark: a door viewer seen head-on. Concentric rings and a wide iris, because the
+       thing this add-on exists for is the fisheye peephole rather than a boxed IP camera —
+       and because a lens says "video source" without needing a body shape at all.
+       There is deliberately no cloud in the drawing. An earlier sketch had the stream
+       arriving from a cloud glyph, which was accurate and made the banner an apology: the
+       cloud dependency belongs in the README, stated plainly, not as decoration. -->
+  <g transform="translate(70 60)">
+    <rect width="140" height="140" rx="24" fill="url(#tile)"/>
+
+    <!-- the dark faceplate cut out of the blue tile -->
+    <circle cx="70" cy="70" r="54" fill="#07202c" opacity="0.92"/>
+
+    <!-- light coming through the optic, under the rings -->
+    <ellipse cx="70" cy="70" rx="34" ry="34" fill="url(#lit)"/>
+
+    <!-- the rings of the optic -->
+    <g fill="none" stroke="#9fdcf7" opacity="0.55">
+      <circle cx="70" cy="70" r="44"/>
+      <circle cx="70" cy="70" r="33"/>
+    </g>
+
+    <!-- the iris, and the highlight that makes it read as glass rather than a hole -->
+    <circle cx="70" cy="70" r="21" fill="#0b2836" stroke="#c9ecfb" stroke-opacity="0.7" stroke-width="2"/>
+    <circle cx="61" cy="61" r="6" fill="#eaf8ff" opacity="0.75"/>
+  </g>
+
+  <text x="248" y="112" font-family="'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif"
+        font-size="58" font-weight="700" fill="url(#word)" letter-spacing="0.5">EZVIZ Stream Bridge</text>
+  <text x="250" y="151" font-family="'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif"
+        font-size="24" fill="#8fb0c4">Camera video as MPEG-TS, for go2rtc and Frigate</text>
+
+  <!-- The chip says the constraint, not a feature. Anybody who finds this project is looking
+       for a local stream, and the first thing they need to know is the one thing it is not. -->
+  <g transform="translate(250 173)">
+    <rect width="524" height="32" rx="16" fill="#0e2c3c" stroke="#1c4c63"/>
+    <circle cx="19" cy="16" r="4.5" fill="#41bdf5"/>
+    <text x="34" y="21" font-family="'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif"
+          font-size="15" fill="#a3c2d3">for cameras with no RTSP · needs the EZVIZ cloud to start a stream</text>
+  </g>
+</svg>

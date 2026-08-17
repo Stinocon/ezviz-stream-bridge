@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 200" width="640" height="200">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#41bdf5"/><stop offset="1" stop-color="#1a7fae"/>
+    </linearGradient>
+    <linearGradient id="word" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#0e3346"/><stop offset="1" stop-color="#1a7fae"/>
+    </linearGradient>
+    <radialGradient id="lit" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#ffd9b0" stop-opacity="0.62"/>
+      <stop offset="1" stop-color="#ffd9b0" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <g transform="translate(16 30)">
+    <rect width="140" height="140" rx="24" fill="url(#tile)"/>
+    <circle cx="70" cy="70" r="54" fill="#07202c" opacity="0.92"/>
+    <ellipse cx="70" cy="70" rx="34" ry="34" fill="url(#lit)"/>
+    <g fill="none" stroke="#9fdcf7" opacity="0.55" stroke-width="2">
+      <circle cx="70" cy="70" r="44"/><circle cx="70" cy="70" r="33"/>
+    </g>
+    <circle cx="70" cy="70" r="21" fill="#0b2836" stroke="#c9ecfb" stroke-opacity="0.7" stroke-width="2"/>
+    <circle cx="61" cy="61" r="6" fill="#eaf8ff" opacity="0.75"/>
+  </g>
+  <text x="180" y="92" font-family="'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif"
+        font-size="42" font-weight="700" fill="url(#word)">EZVIZ Stream</text>
+  <text x="180" y="140" font-family="'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif"
+        font-size="42" font-weight="700" fill="url(#word)">Bridge</text>
+</svg>

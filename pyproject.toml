@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ezviz-stream-bridge"
+version = "0.1.0"
+description = "Serve EZVIZ camera video as local MPEG-TS for go2rtc, Frigate and Home Assistant"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+authors = [{ name = "Stinocon" }]
+keywords = ["ezviz", "home-assistant", "frigate", "go2rtc", "mpegts", "rtsp"]
+
+# pyezvizapi does the whole cloud and stream protocol; this package is the supervisor
+# that keeps a session alive and one proxy running per camera. The lower bound is the
+# first release carrying `stream proxy`, which is the command everything here builds on.
+dependencies = ["pyezvizapi>=1.0.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+ezviz-stream-bridge = "ezviz_stream_bridge.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/Stinocon/ezviz-stream-bridge"
+"Add-on repository" = "https://github.com/Stinocon/addons"
+
+[tool.setuptools.packages.find]
+include = ["ezviz_stream_bridge*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "S", "C4", "RET", "SIM", "PL"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

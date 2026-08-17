@@ -1,0 +1,51 @@
+# Anything that carries real device or account data.
+#
+# This list is deliberately wider than "files we happen to create". Working on this project
+# means running the tools in tools/ against a real camera, and their output contains the
+# account token, the device serial, the KMS key, the WAN address and, in the case of the
+# captures, pictures of somebody's front door. One `git add -A` on a tired evening is all it
+# takes, so the patterns are here rather than in anybody's memory.
+ezviz_token.json
+*token*.json
+options.json
+devinfos*.json
+device_infos*.json
+pagelist*.json
+*credentials*.json
+*.metadata.json
+
+# Captures and media pulled off a camera.
+*.pcap
+*.pcapng
+*.ts
+*.ps
+*.tmp
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.h264
+*.hevc
+!docs/brand/*.png
+
+# Scan and probe output.
+*.nmap
+fullscan*.txt
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
