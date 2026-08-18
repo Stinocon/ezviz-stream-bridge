@@ -57,7 +57,8 @@ Measured through this bridge: **~4.3 s to first byte, first keyframe 1.4 s in**,
 seconds from request to a decodable frame, with keyframes every 4 s. Recording starts mid-scene
 by construction.
 
-The full account, with the Frigate configuration, is in the
+The full account — the Frigate configuration, and a worked Home Assistant example that gates the
+stream on the camera's own motion sensor — is in the
 [add-on README](https://github.com/Stinocon/addons/tree/master/ezviz-stream-bridge).
 
 ## How it works
