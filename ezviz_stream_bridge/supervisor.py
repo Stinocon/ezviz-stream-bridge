@@ -226,6 +226,11 @@ class Supervisor:
             str(self._tokens.path),
             "--region",
             self._config.region,
+            # The proxy logs the whole connection lifecycle, and at debug it also logs
+            # the consumer's request headers -- the only extra identity the bridge can
+            # offer. Without this the configured log level stopped at the supervisor.
+            "--log-level",
+            self._config.log_level,
         ]
 
         try:
@@ -294,22 +299,3 @@ class Supervisor:
     def _clock(self) -> float:
         """Monotonic seconds, injectable for tests."""
         return self._now()
-
-
-def configure_logging(level: str) -> None:
-    """Send logs to stdout, which is what the add-on log shows."""
-    numeric = {
-        "trace": logging.DEBUG,
-        "debug": logging.DEBUG,
-        "info": logging.INFO,
-        "notice": logging.INFO,
-        "warning": logging.WARNING,
-        "error": logging.ERROR,
-        "fatal": logging.CRITICAL,
-    }.get(level, logging.INFO)
-
-    logging.basicConfig(
-        stream=sys.stdout,
-        level=numeric,
-        format="[%(levelname)s] %(message)s",
-    )

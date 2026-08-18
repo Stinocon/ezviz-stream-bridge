@@ -46,10 +46,16 @@ Every connection opens a cloud session and makes the camera encode and upload, s
 consumer means an always-encoding camera — hours of battery on a doorbell, not months.
 
 That does not mean Frigate's `detect` and `record` are useless here: it means they must be
-**event-gated**, switched on via `frigate/<camera>/detect/set` when the doorbell event arrives
-and off again after. Measured through this bridge: **~4.3 s to first byte, first keyframe 1.4 s
-in**, so about six seconds from request to a decodable frame, with keyframes every 4 s.
-Recording starts mid-scene by construction.
+**event-gated**. Gate them with `frigate/<camera>/enabled/set`, which is the only one of
+Frigate's MQTT switches that stops the stream being consumed: `detect`, `recordings` and
+`snapshots` change what Frigate does with the frames, not whether FFmpeg keeps pulling them
+(verified in Frigate 0.16–0.18; `enabled` does not exist before 0.16). Note also that go2rtc is
+a separate process that knows nothing about that flag, so any live view — the Frigate UI, a
+dashboard card — opens a consumer of its own regardless.
+
+Measured through this bridge: **~4.3 s to first byte, first keyframe 1.4 s in**, so about six
+seconds from request to a decodable frame, with keyframes every 4 s. Recording starts mid-scene
+by construction.
 
 The full account, with the Frigate configuration, is in the
 [add-on README](https://github.com/Stinocon/addons/tree/master/ezviz-stream-bridge).
@@ -73,9 +79,20 @@ This project is the part that has to keep working for weeks unattended:
   cannot work — a serial that is not on the account — backs off instead of looping.
 - **On-demand by construction, and instrumented.** The proxy runs in-process, so every HTTP
   connection is logged with an id, source address and User-Agent, and one VTM session opens per
-  connection and closes the instant the client disconnects. No client, no VTM, no camera drain;
-  the bridge never generates a request of its own, so an `active` count that will not return to
-  0 points straight at the external consumer holding it open.
+  connection. No client, no VTM, no camera drain; the bridge never generates a request of its
+  own, so an `active` count that will not return to 0 points straight at the external consumer
+  holding it open.
+- **A session cannot outlive its consumer.** The request socket is watched for a peer close, so
+  a consumer that disappears is noticed within half a second even when no video is flowing and
+  there is nothing to write to it — which is exactly when a battery camera is asleep and the
+  cloud session is most expensive. As a backstop, a session that gets no video at all within
+  `--first-video-timeout` (25 s by default, under go2rtc's hardcoded 30 s) closes itself instead
+  of being left behind. Before 0.1.3 both cases leaked a cloud session that the bridge's own
+  keepalives then held open indefinitely.
+- **Timestamps you can line up with other logs.** Every line carries an ISO-8601 local time to
+  the millisecond, and each session reports `session opened`, `first-video` (the camera starting
+  to send) and `first-byte` (the consumer starting to receive), so a wake-up can be measured
+  against Frigate, go2rtc and Home Assistant rather than guessed at.
 - **Session handling in one place.** The token is verified before every proxy start and renewed
   when the cloud stops accepting it. It is kept on `/data`, because a fresh login on every
   start is a login EZVIZ counts and rate-limits.
@@ -109,6 +126,11 @@ the run fails, and the log then lists every camera on the account with its seria
 the EZVIZ app under *Settings → Device Information*, and on the device label near the QR code.
 `region` is `apiieu` for Europe, `apius` for the Americas, `apiisgp` for Singapore; the wrong
 one looks exactly like a wrong password.
+
+A single camera's proxy can also be run on its own, which is the quickest way to watch one
+connection's lifecycle: `python -m ezviz_stream_bridge.proxy --help`. `--first-video-timeout`
+sets the no-video budget (`0` disables it, restoring the pre-0.1.3 behaviour of waiting
+indefinitely) and `--log-level debug` adds the consumer's request headers to the log.
 
 ## Investigation tools
 
