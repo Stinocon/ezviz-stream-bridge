@@ -7,11 +7,12 @@ counter that the logs report, which must stay correct under concurrent connect/c
 
 from __future__ import annotations
 
+import socket
 import threading
 
 import pytest
 
-from ezviz_stream_bridge.proxy import ProxyServer
+from ezviz_stream_bridge.proxy import PEER_POLL_INTERVAL, ProxyServer, watch_peer
 
 
 @pytest.fixture
@@ -62,3 +63,42 @@ def test_counters_are_consistent_under_concurrency(server: ProxyServer) -> None:
     # 8 threads * 1000 ids consumed 1..8000; the next id is 8001. opened()/closed()
     # do not touch the id counter.
     assert server.next_id() == 8 * 1000 + 1
+
+
+def test_watch_peer_fires_when_the_consumer_hangs_up() -> None:
+    """The detector that replaces "find out on the next write".
+
+    A stream consumer never sends anything after its GET, so a readable socket with
+    nothing on it is the consumer having closed -- which is the only signal available
+    while the camera is asleep and there is nothing to write to it.
+    """
+    near, far = socket.socketpair()
+    stop = threading.Event()
+    gone = threading.Event()
+    watcher = threading.Thread(target=watch_peer, args=(near, stop, gone.set), daemon=True)
+    watcher.start()
+    try:
+        assert not gone.wait(PEER_POLL_INTERVAL * 2), "fired while the peer was still there"
+        far.close()
+        assert gone.wait(PEER_POLL_INTERVAL * 6), "did not notice the peer closing"
+    finally:
+        stop.set()
+        watcher.join(timeout=2.0)
+        near.close()
+
+
+def test_watch_peer_ignores_a_client_that_sends_something() -> None:
+    """Unexpected inbound bytes are not a disconnect, and must not become a spin."""
+    near, far = socket.socketpair()
+    stop = threading.Event()
+    gone = threading.Event()
+    watcher = threading.Thread(target=watch_peer, args=(near, stop, gone.set), daemon=True)
+    watcher.start()
+    try:
+        far.send(b"unexpected")
+        assert not gone.wait(PEER_POLL_INTERVAL * 3)
+    finally:
+        stop.set()
+        watcher.join(timeout=2.0)
+        near.close()
+        far.close()

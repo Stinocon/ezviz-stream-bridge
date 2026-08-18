@@ -12,7 +12,8 @@ from pyezvizapi.client import EzvizClient
 
 from .config import DEFAULT_REGION, BridgeConfig, ConfigError, load_options
 from .devices import list_account_cameras
-from .supervisor import Supervisor, configure_logging
+from .log import configure_logging
+from .supervisor import Supervisor
 from .token import TokenStore
 
 _LOGGER = logging.getLogger(__name__)

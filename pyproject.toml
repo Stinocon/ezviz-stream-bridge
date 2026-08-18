@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ezviz-stream-bridge"
-version = "0.1.2"
+version = "0.1.3"
 description = "Serve EZVIZ camera video as local MPEG-TS for go2rtc, Frigate and Home Assistant"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -13,9 +13,11 @@ authors = [{ name = "Stinocon" }]
 keywords = ["ezviz", "home-assistant", "frigate", "go2rtc", "mpegts", "rtsp"]
 
 # pyezvizapi does the whole cloud and stream protocol; this package is the supervisor
-# that keeps a session alive and one proxy running per camera. The lower bound is the
-# first release carrying `stream proxy`, which is the command everything here builds on.
-dependencies = ["pyezvizapi>=1.0.0"]
+# that keeps a session alive and one proxy running per camera. The lower bound is 1.0.5:
+# since 0.1.3 the session is driven through `open_cloud_stream(socket_factory=...)` and
+# `iter_packets(include_control=True)`, which is what makes a session cancellable while
+# the camera is silent.
+dependencies = ["pyezvizapi>=1.0.5"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]
