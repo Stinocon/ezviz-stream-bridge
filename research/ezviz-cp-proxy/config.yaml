@@ -1,0 +1,35 @@
+---
+name: EZVIZ Control-Plane Proxy
+version: "0.3.0"
+slug: ezviz_cp_proxy
+description: >-
+  Diagnostic transparent TCP relay / replay mock for one EZVIZ control-plane
+  port. In relay mode it forwards every byte to the real EZVIZ host and records
+  it; in replay mode it answers the camera from a recorded server script to test
+  emulation. The router dst-nats the camera's port to this add-on.
+url: "https://github.com/Stinocon/ezviz-stream-bridge"
+arch:
+  - amd64
+  - aarch64
+startup: application
+boot: manual
+init: false
+host_network: true
+map:
+  - share:rw
+options:
+  listen_port: 19666
+  mode: relay
+  upstream_host: litedev.eu.ezvizlife.com
+  upstream_port: 8666
+  replay_file: /share/ezviz-cp-proxy/replay.json
+  log_payload: false
+  pcap: true
+schema:
+  listen_port: port
+  mode: list(relay|replay)
+  upstream_host: str
+  upstream_port: port
+  replay_file: str
+  log_payload: bool
+  pcap: bool
