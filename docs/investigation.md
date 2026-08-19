@@ -630,11 +630,13 @@ tshark -i <iface> -f "udp port 37008" -w cloud.pcapng   # TZSP is dissected auto
 Captures made this way contain the real serial, account-bound addresses and a device credential,
 so they stay out of the repository — only sanitized structure belongs here.
 
-The in-path relay and `:8666` replay/MQTT-analysis work behind Findings 9–12 used a separate
-research add-on (a plaintext TCP relay with a record/replay mode) plus the router NAT recipe in
-Finding 9, and a minimal raw-TCP MQTT-CONNECT replayer. Those are research artifacts kept in the
-working tree, not shipped tools here, because they only make sense pointed at one's own device and
-their captures carry the serial, token and MQTT material that must never enter a repository.
+The in-path relay and `:8666` replay/MQTT-analysis work behind Findings 9–12 used a plaintext TCP
+relay with a record/replay mode (a Home Assistant OS add-on) plus the router NAT recipe in
+Finding 9, and a minimal raw-TCP MQTT-CONNECT replayer. Those live under
+[`research/`](../research/), deliberately kept out of the packaged add-on: they only make sense
+pointed at one's own device, and the recorded scripts and captures they consume carry the serial,
+token and MQTT material that must never enter a repository (so those inputs are not published —
+you generate them from your own capture).
 
 ## Credit
 
