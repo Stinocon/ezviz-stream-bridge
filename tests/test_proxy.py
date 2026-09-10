@@ -13,6 +13,7 @@ import threading
 import pytest
 
 from ezviz_stream_bridge.proxy import PEER_POLL_INTERVAL, ProxyServer, watch_peer
+from ezviz_stream_bridge.session import CloudSession
 
 
 @pytest.fixture
@@ -102,3 +103,80 @@ def test_watch_peer_ignores_a_client_that_sends_something() -> None:
         watcher.join(timeout=2.0)
         near.close()
         far.close()
+
+
+class FakeClock:
+    """A monotonic clock and sleep that advance together, so cooldown waits stay fast."""
+
+    def __init__(self) -> None:
+        self.value = 1000.0
+
+    def now(self) -> float:
+        return self.value
+
+    def sleep(self, seconds: float) -> None:
+        self.value += seconds
+
+
+def _cooldown_server(timeout_cooldown: float) -> tuple[ProxyServer, FakeClock]:
+    clock = FakeClock()
+    server = ProxyServer(
+        ("127.0.0.1", 0),
+        client=object(),
+        serial="BB1234567",
+        path="/BB1234567.ts",
+        ffmpeg_path="ffmpeg",
+        timeout_cooldown=timeout_cooldown,
+        monotonic=clock.now,
+        sleep=clock.sleep,
+    )
+    return server, clock
+
+
+def test_start_cooldown_sets_a_deadline() -> None:
+    """A camera timeout arms the cooldown; a new wake-up is delayed by exactly it."""
+    server, clock = _cooldown_server(30.0)
+    server.start_cooldown()
+    assert server._cooldown_until == clock.now() + 30.0
+    server.server_close()
+
+
+def test_start_cooldown_disabled_when_configured_to_zero() -> None:
+    """`timeout_cooldown=0` must keep today's behaviour: no delay at all."""
+    server, clock = _cooldown_server(0.0)
+    server.start_cooldown()
+    assert server._cooldown_until == 0.0
+    server.server_close()
+
+
+def test_wait_for_cooldown_returns_when_there_is_nothing_to_wait() -> None:
+    """With no cooldown armed, the handler proceeds straight to opening the VTM."""
+    server, clock = _cooldown_server(30.0)
+    session = CloudSession(object(), "BB1234567")
+    before = clock.now()
+    server.wait_for_cooldown(session)
+    assert clock.now() == before
+    server.server_close()
+
+
+def test_wait_for_cooldown_blocks_until_the_cooldown_elapses() -> None:
+    """After a timeout the next session is withheld for the whole cooldown."""
+    server, clock = _cooldown_server(30.0)
+    server.start_cooldown()
+    session = CloudSession(object(), "BB1234567")
+    before = clock.now()
+    server.wait_for_cooldown(session)
+    assert clock.now() >= before + 30.0
+    server.server_close()
+
+
+def test_wait_for_cooldown_returns_when_the_consumer_has_gone() -> None:
+    """A consumer that leaves during the cooldown must not be made to wait for it."""
+    server, clock = _cooldown_server(30.0)
+    server.start_cooldown()
+    session = CloudSession(object(), "BB1234567")
+    session.abort("client gone")
+    before = clock.now()
+    server.wait_for_cooldown(session)
+    assert clock.now() == before  # returned immediately, no sleep
+    server.server_close()

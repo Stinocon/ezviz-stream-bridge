@@ -90,6 +90,12 @@ This project is the part that has to keep working for weeks unattended:
   `--first-video-timeout` (25 s by default, under go2rtc's hardcoded 30 s) closes itself instead
   of being left behind. Before 0.1.3 both cases leaked a cloud session that the bridge's own
   keepalives then held open indefinitely.
+- **A camera timeout is not a reason to wake the camera again.** When a session ends because the
+  camera went offline mid-stream, the bridge withholds the next VTM session for
+  `--timeout-cooldown` (30 s by default, `0` disables it). A consumer that reconnects the instant
+  its response closes — FFmpeg through go2rtc does exactly this — is made to wait instead of
+  waking a camera that has only just fallen asleep. The cooldown is a pause between inbound
+  requests, never a request the bridge originates, and it ends early if the consumer leaves.
 - **Timestamps you can line up with other logs.** Every line carries an ISO-8601 local time to
   the millisecond, and each session reports `session opened`, `first-video` (the camera starting
   to send) and `first-byte` (the consumer starting to receive), so a wake-up can be measured
@@ -131,7 +137,8 @@ one looks exactly like a wrong password.
 A single camera's proxy can also be run on its own, which is the quickest way to watch one
 connection's lifecycle: `python -m ezviz_stream_bridge.proxy --help`. `--first-video-timeout`
 sets the no-video budget (`0` disables it, restoring the pre-0.1.3 behaviour of waiting
-indefinitely) and `--log-level debug` adds the consumer's request headers to the log.
+indefinitely), `--timeout-cooldown` sets how long a new session is withheld after a camera
+timeout (`0` disables it), and `--log-level debug` adds the consumer's request headers to the log.
 
 ## Investigation tools
 

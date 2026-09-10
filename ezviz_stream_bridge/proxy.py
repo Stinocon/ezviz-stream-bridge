@@ -13,6 +13,11 @@ instant the client goes away. No client, no VTM, no camera battery drain. Every 
 in the log is therefore an inbound request from a real consumer, never something the
 bridge generated itself.
 
+The one deliberate exception is the post-timeout cooldown: when a session ends because
+the camera went offline mid-stream, the next wake-up is delayed so a reconnect loop in
+the consumer cannot keep a battery camera permanently awake. That is a pause between
+requests, never a request the bridge originates.
+
 "the instant the client goes away" is the part that needed work, and is why this module
 now watches the request socket for a peer close instead of finding out on the next
 write. A consumer that disconnects while the camera is asleep produces no write at all,
@@ -48,6 +53,12 @@ _LOGGER = logging.getLogger(__name__)
 # any downstream timeout that matters and costs two syscalls per second per connection.
 PEER_POLL_INTERVAL = 0.5
 
+# How long a new VTM session is withheld after a "camera timeout". A timeout means the
+# camera went offline mid-stream and is back to sleep; opening a session the instant the
+# consumer reconnects would wake it again seconds after it just fell asleep -- the loop
+# that flattens a battery camera. 0 disables the cooldown.
+TIMEOUT_COOLDOWN = 30.0
+
 
 class ProxyServer(ThreadingHTTPServer):
     """Threaded HTTP server holding the shared client and per-camera settings.
@@ -68,12 +79,20 @@ class ProxyServer(ThreadingHTTPServer):
         path: str,
         ffmpeg_path: str,
         first_video_timeout: float = DEFAULT_FIRST_VIDEO_TIMEOUT,
+        timeout_cooldown: float = TIMEOUT_COOLDOWN,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.client = client
         self.serial = serial
         self.path = path
         self.ffmpeg_path = ffmpeg_path
         self.first_video_timeout = first_video_timeout
+        self.timeout_cooldown = timeout_cooldown
+        self._now = monotonic
+        self._sleep = sleep
+        self._cooldown_until = 0.0
+        self._cooldown_lock = threading.Lock()
         self._ids = itertools.count(1)
         self._active = 0
         self._active_lock = threading.Lock()
@@ -94,6 +113,34 @@ class ProxyServer(ThreadingHTTPServer):
         with self._active_lock:
             self._active -= 1
             return self._active
+
+    def start_cooldown(self) -> None:
+        """Begin the post-timeout cooldown, during which no VTM session may open.
+
+        A "camera timeout" means the camera went offline mid-stream and is back to
+        sleep. Serving the very next GET immediately would wake it again seconds after
+        it just fell asleep, which is the loop that flattens a battery camera. The
+        cooldown forces a pause between that failure and the next wake-up. No-op when
+        `timeout_cooldown` is 0.
+        """
+        if self.timeout_cooldown <= 0:
+            return
+        with self._cooldown_lock:
+            self._cooldown_until = self._now() + self.timeout_cooldown
+
+    def wait_for_cooldown(self, session: CloudSession) -> None:
+        """Block until the cooldown has elapsed, or the consumer has gone away.
+
+        Called on the handler thread before a VTM session is opened. If the consumer
+        disconnects while we wait, the peer watchdog aborts `session` and this returns
+        immediately, so a dead connection never turns into a wake-up.
+        """
+        while session.abort_reason is None:
+            with self._cooldown_lock:
+                remaining = self._cooldown_until - self._now()
+            if remaining <= 0:
+                return
+            self._sleep(min(remaining, PEER_POLL_INTERVAL))
 
 
 def watch_peer(sock: socket.socket, stop: threading.Event, on_gone: Callable[[], None]) -> None:
@@ -195,7 +242,6 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
 
-            _LOGGER.info("[VTM]  conn=%d session opening", conn_id)
             # One VTM session for the life of this request, and one watchdog that can
             # end it the moment the consumer disappears -- including while the camera is
             # asleep and nothing is being written, which is precisely when a disconnect
@@ -208,15 +254,31 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             )
             watcher.start()
 
-            session.run(cast(BinaryIO, self.wfile))
-            reason = _REASONS.get(session.abort_reason or "", reason)
+            # A previous session may have ended because the camera went offline mid-stream
+            # ("camera timeout"). Do not wake it again the instant this consumer reconnects:
+            # wait out the cooldown first, unless the consumer is already gone.
+            server.wait_for_cooldown(session)
+            if session.abort_reason is not None:
+                reason = "client disconnected"
+            else:
+                _LOGGER.info("[VTM]  conn=%d session opening", conn_id)
+                session.run(cast(BinaryIO, self.wfile))
+                reason = _REASONS.get(session.abort_reason or "", reason)
         except (BrokenPipeError, ConnectionResetError):
             reason = "client disconnected"
         except DeviceException as err:
             # The camera did not deliver in time -- asleep, or waking slowly. Expected
             # for a battery doorbell; the consumer will retry with a fresh GET.
             reason = "camera timeout"
+            server.start_cooldown()
             _LOGGER.warning("[VTM]  conn=%d %s", conn_id, err)
+            if server.timeout_cooldown > 0:
+                _LOGGER.info(
+                    "[VTM]  conn=%d camera went offline mid-stream; "
+                    "next wake delayed %.0fs",
+                    conn_id,
+                    server.timeout_cooldown,
+                )
         except PyEzvizError as err:
             reason = "error"
             _LOGGER.error("[VTM]  conn=%d %s", conn_id, err)
@@ -279,6 +341,15 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             f"session (default: {DEFAULT_FIRST_VIDEO_TIMEOUT:g}, 0 disables it)"
         ),
     )
+    parser.add_argument(
+        "--timeout-cooldown",
+        type=float,
+        default=TIMEOUT_COOLDOWN,
+        help=(
+            "seconds to wait after a camera timeout before opening a new VTM session "
+            f"(default: {TIMEOUT_COOLDOWN:g}, 0 disables it)"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -302,6 +373,7 @@ def main(argv: list[str] | None = None) -> int:
             path=path,
             ffmpeg_path=args.ffmpeg_path,
             first_video_timeout=args.first_video_timeout,
+            timeout_cooldown=args.timeout_cooldown,
         )
     except OSError as err:
         _LOGGER.error("Could not bind proxy to %s:%d: %s", args.host, args.port, err)
