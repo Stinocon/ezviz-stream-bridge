@@ -10,6 +10,10 @@ else that speaks FFmpeg can use a camera that offers no RTSP.
 This is the source repository. Installed as a Home Assistant add-on from
 **[Stinocon/addons](https://github.com/Stinocon/addons)**.
 
+> **Read this first.** A personal project, published as is and with no warranty: it is not a
+> finished product nor a commercial one, and it will not become either. It was written in large
+> part with an AI assistant, under human guidance and review.
+
 ## The point of this, stated honestly
 
 Some EZVIZ devices — the video door viewers and several battery models — have no local video
