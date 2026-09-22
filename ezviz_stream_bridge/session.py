@@ -34,7 +34,7 @@ from typing import Any, BinaryIO
 
 from pyezvizapi.cloud_stream import open_cloud_stream
 from pyezvizapi.exceptions import PyEzvizError
-from pyezvizapi.stream import VtmChannel, detect_transport
+from pyezvizapi.stream import VtmChannel
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -77,10 +77,64 @@ _FFMPEG_STDERR_MAX_LINES = 20
 _FFMPEG_STDERR_MAX_LINE = 500
 _FFMPEG_STDERR_JOIN_TIMEOUT = 2.0
 
-# How many leading video packets to classify when the diagnostic is on. One packet can
-# start mid-frame, so a few are sampled; the point is to answer "is this MPEG-PS at all?"
-# without waiting for FFmpeg.
-_PAYLOAD_SNIFF_PACKETS = 3
+# When the diagnostic capture is on, the transport sniff buffers a bounded prefix of the
+# video payload and looks for a real signature in it. It does not classify each packet's
+# first byte: VTM packets are arbitrary chunks of the byte stream, so a packet can start
+# mid-pack and hand the sniff a mid-stream byte that reads as RTP -- which is what the first
+# version did, and it looked like a fault. The prefix is scanned once enough of it is in hand
+# that a signature has to be present, and once more if the stream ends first.
+_PAYLOAD_SNIFF_BYTES = 8192
+_PAYLOAD_SNIFF_PACKETS = 8
+
+# MPEG-PS pack_start_code. The byte after `00 00 01` is 0xBA, whose top bit is set -- the
+# forbidden_zero_bit of an H.264/H.265 NAL header -- so it cannot be a valid NAL, and a
+# conformant elementary stream cannot contain this sequence (emulation prevention blocks
+# `00 00 01` inside a NAL). Finding it is strong evidence of MPEG-PS.
+_PS_PACK_START = b"\x00\x00\x01\xba"
+_TS_SYNC_BYTE = 0x47
+_TS_PACKET_SIZE = 188
+# Sync bytes required on the 188-byte grid. Two is a coincidence about one time in nine on
+# random data; three is about one time in two thousand, low enough to trust as a diagnostic.
+_TS_SYNC_RUN = 3
+# The two top bits of an RTP header byte carry the version, which is 2 here.
+_RTP_VERSION_MASK = 0xC0
+_RTP_VERSION_2 = 0x80
+
+
+def _looks_like_mpeg_ts(data: bytes, start: int) -> bool:
+    """True when 0x47 repeats on the 188-byte grid from `start` for several packets."""
+    for index in range(1, _TS_SYNC_RUN):
+        position = start + index * _TS_PACKET_SIZE
+        if position >= len(data) or data[position] != _TS_SYNC_BYTE:
+            return False
+    return True
+
+
+def classify_payload(data: bytes) -> tuple[str, int]:
+    """Best-effort transport for a buffered prefix, and where its signature sits.
+
+    Returns a `pyezvizapi` `StreamTransport` name and the byte offset of the signature, or
+    -1 when nothing recognisable is present. MPEG-PS is checked first and recognised by its
+    pack start code, which may sit at any offset when the prefix starts mid-pack -- the
+    reason a single-packet check could not see it. RTP has no in-band sync pattern, so it is
+    only recognisable at the start of the buffer, and it is checked last: a mid-packet TS
+    start whose first byte happens to carry RTP's version bits would otherwise be reported
+    as RTP, far more often than a genuine RTP payload would produce a chance 0x47 grid.
+    """
+    pack = data.find(_PS_PACK_START)
+    if pack >= 0:
+        return "MPEG_PS", pack
+
+    sync = data.find(bytes((_TS_SYNC_BYTE,)))
+    while sync >= 0:
+        if _looks_like_mpeg_ts(data, sync):
+            return "MPEG_TS", sync
+        sync = data.find(bytes((_TS_SYNC_BYTE,)), sync + 1)
+
+    if data and (data[0] & _RTP_VERSION_MASK) == _RTP_VERSION_2:
+        return "RTP", 0
+
+    return "UNKNOWN", -1
 
 
 @dataclass
@@ -123,6 +177,9 @@ class CloudSession:
 
         self._lock = threading.Lock()
         self._cancel = threading.Event()
+        self._sniff_buffer = bytearray()
+        self._sniff_packets = 0
+        self._sniffed = False
         self._abort_reason: str | None = None
         self._socket: socket.socket | None = None
         self._ffmpeg: subprocess.Popen[bytes] | None = None
@@ -349,6 +406,46 @@ class CloudSession:
             # The pipe was closed during teardown. That is the expected way out.
             return
 
+    def _sniff_payload(self, body: bytes) -> None:
+        """Buffer the leading payload and classify its transport once.
+
+        Deferred until enough of the prefix is in hand that a signature has to be present,
+        which is what makes the answer independent of where the VTM packet boundaries fell.
+        """
+        if not self._ffmpeg_stderr or self._sniffed or not body:
+            return
+        self._sniff_buffer.extend(body)
+        self._sniff_packets += 1
+        if (
+            len(self._sniff_buffer) < _PAYLOAD_SNIFF_BYTES
+            and self._sniff_packets < _PAYLOAD_SNIFF_PACKETS
+        ):
+            return
+        self._report_transport()
+
+    def _flush_sniff(self) -> None:
+        """Report whatever prefix was buffered when the stream ended mid-sniff."""
+        if not self._ffmpeg_stderr or self._sniffed or not self._sniff_buffer:
+            return
+        self._report_transport()
+
+    def _report_transport(self) -> None:
+        """Classify the buffered prefix and log it once, with where its signature sits."""
+        data = bytes(self._sniff_buffer)
+        if not data:
+            # Nothing to classify yet (only empty bodies so far); keep waiting rather than
+            # logging an empty UNKNOWN and locking the sniff.
+            return
+        self._sniffed = True
+        transport, offset = classify_payload(data)
+        _LOGGER.info(
+            "[FFmpeg] %spayload transport=%s at offset=%d head=%s",
+            self._label(),
+            transport,
+            offset,
+            data[:24].hex(" "),
+        )
+
     def _pump_vtm_to_ffmpeg(self, stream: Any, ffmpeg: subprocess.Popen[bytes]) -> None:
         """VTM packets -> FFmpeg stdin, until the stream ends or the session aborts."""
         stdin = ffmpeg.stdin
@@ -371,16 +468,7 @@ class CloudSession:
                     )
                 if self.metrics.first_video_at is None:
                     self._record("first-video")
-                if self._ffmpeg_stderr and self.metrics.video_packets < _PAYLOAD_SNIFF_PACKETS:
-                    # Answers "is this MPEG-PS at all?" directly, so a transport mismatch
-                    # does not have to be inferred from FFmpeg's silence.
-                    _LOGGER.info(
-                        "[FFmpeg] %spayload #%d transport=%s head=%s",
-                        self._label(),
-                        self.metrics.video_packets + 1,
-                        detect_transport(packet.body).name,
-                        packet.body[:12].hex(" "),
-                    )
+                self._sniff_payload(packet.body)
                 self.metrics.video_packets += 1
                 if packet.body:
                     stdin.write(packet.body)
@@ -394,6 +482,9 @@ class CloudSession:
             if not self._cancel.is_set():
                 self._writer_error = err
         finally:
+            # Report the prefix even if the stream ended before the sniff threshold, so a
+            # short or stalled session still says what its payload looked like.
+            self._flush_sniff()
             # EOF for FFmpeg, which is what ends a session that stopped on its own.
             with suppress(OSError):
                 stdin.close()

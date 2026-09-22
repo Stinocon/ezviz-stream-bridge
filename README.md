@@ -103,9 +103,10 @@ This project is the part that has to keep working for weeks unattended:
 - **A remux that produces nothing can be explained, not guessed at.** FFmpeg's stderr is
   discarded by default; with `log_ffmpeg_stderr` (or `--log-ffmpeg-stderr` on the proxy) it is run
   at `info` and its output logged, bounded to 20 lines and then a single suppression notice. It
-  also reports the detected payload transport (MPEG-PS, MPEG-TS, RTP or unknown) of the first
-  video packets. This is the first thing to turn on when a camera sends video but no MPEG-TS
-  comes out.
+  also reports the detected payload transport (MPEG-PS, MPEG-TS, RTP or unknown) and where its
+  signature sits in the leading payload — buffered across VTM packets, so a packet boundary
+  cannot hide an MPEG-PS or MPEG-TS signature. This is the first thing to turn on when a camera
+  sends video but no MPEG-TS comes out.
 - **Timestamps you can line up with other logs.** Every line carries an ISO-8601 local time to
   the millisecond, and each session reports `session opened`, `first-video` (the camera starting
   to send) and `first-byte` (the consumer starting to receive), so a wake-up can be measured

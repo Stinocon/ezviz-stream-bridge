@@ -26,7 +26,7 @@ from pyezvizapi.exceptions import PyEzvizError
 from pyezvizapi.stream import VtmChannel
 
 from ezviz_stream_bridge import session as session_module
-from ezviz_stream_bridge.session import CloudSession
+from ezviz_stream_bridge.session import CloudSession, classify_payload
 
 # Generous: the teardown paths under test are meant to take milliseconds. These bounds
 # only need to fail loudly if something blocks, which before 0.1.3 it did forever.
@@ -527,10 +527,11 @@ def test_ffmpeg_stderr_is_captured_and_bounded(vtm, tmp_path, caplog) -> None:
     the fake FFmpeg would block on the write and never reach `cat`.
     """
     caplog.set_level(logging.INFO)
+    packet_body = b"\x00\x00\x01\xba" + b"data"
     ffmpeg_path, args_file = _arg_recording_ffmpeg(
         tmp_path, stderr_lines=1000, line_padding=200
     )
-    vtm([video(b"data")], silent_after=False)
+    vtm([video(packet_body)], silent_after=False)
     session = CloudSession(
         object(),
         "BB1234567",
@@ -546,7 +547,7 @@ def test_ffmpeg_stderr_is_captured_and_bounded(vtm, tmp_path, caplog) -> None:
     assert not thread.is_alive()
     assert errors == []
     assert _loglevel_arg(args_file) == "info"
-    assert bytes(sink.data) == b"data", "the fake FFmpeg blocked on stderr and never drained"
+    assert bytes(sink.data) == packet_body, "the fake FFmpeg blocked on stderr and never drained"
 
     lines = [
         record.getMessage() for record in caplog.records if "[FFmpeg]" in record.getMessage()
@@ -554,8 +555,140 @@ def test_ffmpeg_stderr_is_captured_and_bounded(vtm, tmp_path, caplog) -> None:
     complaints = [line for line in lines if "demux complaint" in line]
     assert len(complaints) == session_module._FFMPEG_STDERR_MAX_LINES
     assert any("further stderr suppressed" in line for line in lines)
-    assert any("payload #1 transport=" in line for line in lines)
+    payload_lines = [line for line in lines if "payload transport=" in line]
+    assert len(payload_lines) == 1, "the sniff must log once, not once per packet"
+    assert "transport=MPEG_PS at offset=0" in payload_lines[0]
     assert all("conn=7" in line for line in lines)
+
+
+def test_classify_payload_recognises_mpeg_ps_at_any_offset() -> None:
+    # The prefix starts mid-pack; the pack start code is what makes it PS, and it sits 100
+    # bytes in. A per-packet check of the first byte could never see it.
+    data = b"\x11" * 100 + b"\x00\x00\x01\xba" + b"\x22" * 50
+
+    assert classify_payload(data) == ("MPEG_PS", 100)
+
+
+def test_classify_payload_recognises_mpeg_ts_on_the_sync_grid() -> None:
+    data = (
+        bytes([0x47])
+        + b"\x00" * 187
+        + bytes([0x47])
+        + b"\x00" * 187
+        + bytes([0x47])
+        + b"\x00" * 10
+    )
+
+    assert classify_payload(data) == ("MPEG_TS", 0)
+
+
+def test_classify_payload_needs_three_sync_bytes_for_mpeg_ts() -> None:
+    # Two 0x47 bytes 188 apart occur by chance in random data about one time in nine; on a
+    # real RTP stream or an unrecognised payload that was reported as MPEG-TS.
+    data = bytes([0x47]) + b"\x00" * 187 + bytes([0x47]) + b"\x00" * 100
+
+    assert classify_payload(data) == ("UNKNOWN", -1)
+
+
+def test_classify_payload_prefers_the_ts_grid_over_an_rtp_byte() -> None:
+    # A TS stream starting mid-packet whose first byte happens to carry RTP's version bits
+    # (0x80-0xBF) must be MPEG-TS, not RTP: the grid is the stronger evidence.
+    data = (
+        bytes([0x90])
+        + b"\x00" * 4
+        + bytes([0x47])
+        + b"\x00" * 187
+        + bytes([0x47])
+        + b"\x00" * 187
+        + bytes([0x47])
+        + b"\x00" * 10
+    )
+
+    assert classify_payload(data) == ("MPEG_TS", 5)
+
+
+def test_classify_payload_does_not_call_a_lone_sync_byte_mpeg_ts() -> None:
+    assert classify_payload(b"\x00" * 10 + bytes([0x47]) + b"\x00" * 10) == ("UNKNOWN", -1)
+
+
+def test_classify_payload_distinguishes_rtp_from_unknown() -> None:
+    assert classify_payload(bytes([0x80]) + b"\x00" * 8) == ("RTP", 0)
+    assert classify_payload(b"\x00" * 8) == ("UNKNOWN", -1)
+
+
+def test_classify_payload_on_a_bare_pack_header() -> None:
+    assert classify_payload(b"\x00\x00\x01\xba") == ("MPEG_PS", 0)
+
+
+def test_transport_sniff_buffers_across_packet_boundaries(vtm, fake_ffmpeg, caplog) -> None:
+    """The whole point of the buffered sniff: the signature arrives in a later packet."""
+    caplog.set_level(logging.INFO)
+    vtm(
+        [video(b"\x11" * 200), video(b"\x00\x00\x01\xba" + b"\x22" * 100)],
+        silent_after=False,
+    )
+    session = CloudSession(
+        object(),
+        "BB1234567",
+        ffmpeg_path=fake_ffmpeg,
+        first_video_timeout=0,
+        ffmpeg_stderr=True,
+    )
+    sink = Sink()
+    thread, errors = run_in_thread(session, sink)
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert not thread.is_alive()
+    assert errors == []
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "payload transport=" in record.getMessage()
+    ]
+    assert len(lines) == 1
+    assert "transport=MPEG_PS at offset=200" in lines[0]
+
+
+def test_transport_sniff_reports_on_the_threshold_while_the_stream_runs(
+    vtm, fake_ffmpeg, caplog
+) -> None:
+    """The threshold path, not only the end-of-stream flush: it must log once, while live."""
+    caplog.set_level(logging.INFO)
+    made = vtm(
+        [video(b"\x00\x00\x01\xba" + b"\x22" * 40) for _ in range(12)], silent_after=True
+    )
+    session = CloudSession(
+        object(),
+        "BB1234567",
+        ffmpeg_path=fake_ffmpeg,
+        first_video_timeout=0,
+        ffmpeg_stderr=True,
+    )
+    sink = Sink()
+    thread, errors = run_in_thread(session, sink)
+    try:
+        assert made["stream"].iterating.wait(SETTLE)
+        deadline = time.monotonic() + SETTLE
+        sniff_lines: list[str] = []
+        while time.monotonic() < deadline:
+            sniff_lines = [
+                record.getMessage()
+                for record in caplog.records
+                if "payload transport=" in record.getMessage()
+            ]
+            if sniff_lines:
+                break
+            time.sleep(0.01)
+        # The fake VTM blocks after its packets, so the stream is still running here: the
+        # line came from the threshold path, not from the end-of-stream flush.
+        assert thread.is_alive(), "the sniff must fire while the stream is still running"
+        assert len(sniff_lines) == 1, "the sniff must log once, not once per packet"
+        assert "transport=MPEG_PS" in sniff_lines[0]
+    finally:
+        session.abort("client gone")
+        thread.join(timeout=TEARDOWN_LIMIT)
+    assert not thread.is_alive()
+    assert errors == []
 
 
 @pytest.mark.parametrize("capturing", [False, True])
