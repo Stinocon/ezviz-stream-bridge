@@ -80,6 +80,7 @@ class ProxyServer(ThreadingHTTPServer):
         ffmpeg_path: str,
         first_video_timeout: float = DEFAULT_FIRST_VIDEO_TIMEOUT,
         timeout_cooldown: float = TIMEOUT_COOLDOWN,
+        ffmpeg_stderr: bool = False,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -89,6 +90,7 @@ class ProxyServer(ThreadingHTTPServer):
         self.ffmpeg_path = ffmpeg_path
         self.first_video_timeout = first_video_timeout
         self.timeout_cooldown = timeout_cooldown
+        self.ffmpeg_stderr = ffmpeg_stderr
         self._now = monotonic
         self._sleep = sleep
         self._cooldown_until = 0.0
@@ -229,6 +231,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             server.serial,
             ffmpeg_path=server.ffmpeg_path,
             first_video_timeout=server.first_video_timeout,
+            ffmpeg_stderr=server.ffmpeg_stderr,
+            connection_id=conn_id,
             on_event=lambda event, elapsed: _log_session_event(conn_id, event, elapsed),
         )
         stop_watching = threading.Event()
@@ -350,6 +354,14 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             f"(default: {TIMEOUT_COOLDOWN:g}, 0 disables it)"
         ),
     )
+    parser.add_argument(
+        "--log-ffmpeg-stderr",
+        action="store_true",
+        help=(
+            "capture FFmpeg's stderr at `info` level and log it, bounded, instead of "
+            "discarding it; for diagnosing a remux that produces no output"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -374,6 +386,7 @@ def main(argv: list[str] | None = None) -> int:
             ffmpeg_path=args.ffmpeg_path,
             first_video_timeout=args.first_video_timeout,
             timeout_cooldown=args.timeout_cooldown,
+            ffmpeg_stderr=args.log_ffmpeg_stderr,
         )
     except OSError as err:
         _LOGGER.error("Could not bind proxy to %s:%d: %s", args.host, args.port, err)

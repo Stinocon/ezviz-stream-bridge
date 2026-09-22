@@ -233,6 +233,11 @@ class Supervisor:
             self._config.log_level,
         ]
 
+        # Passed only when set: the proxy's own default is off, and adding the flag
+        # unconditionally would be a no-op that reads like it does something.
+        if self._config.log_ffmpeg_stderr:
+            command.append("--log-ffmpeg-stderr")
+
         try:
             # stdout/stderr are inherited so the proxy's own messages land in the
             # add-on log, where the user is already looking, instead of being buffered

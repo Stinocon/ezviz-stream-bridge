@@ -49,6 +49,7 @@ class BridgeConfig:
     region: str
     cameras: tuple[CameraConfig, ...]
     log_level: str
+    log_ffmpeg_stderr: bool = False
 
     @classmethod
     def from_options(cls, options: dict[str, Any]) -> BridgeConfig:
@@ -89,7 +90,20 @@ class BridgeConfig:
             region=region,
             cameras=cameras,
             log_level=str(options.get("log_level") or "info").lower(),
+            log_ffmpeg_stderr=cls._as_bool(options.get("log_ffmpeg_stderr")),
         )
+
+    @staticmethod
+    def _as_bool(value: Any) -> bool:
+        """Read a boolean option that may arrive as a bool or as its text form.
+
+        Home Assistant's JSON gives a real boolean, but the option is also documented
+        for hand-written `options.json`, where `"false"` is the mistake that would
+        otherwise read as true.
+        """
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
 
     @staticmethod
     def _camera(entry: Any, index: int) -> CameraConfig:

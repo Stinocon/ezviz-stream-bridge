@@ -96,6 +96,12 @@ This project is the part that has to keep working for weeks unattended:
   its response closes — FFmpeg through go2rtc does exactly this — is made to wait instead of
   waking a camera that has only just fallen asleep. The cooldown is a pause between inbound
   requests, never a request the bridge originates, and it ends early if the consumer leaves.
+- **A remux that produces nothing can be explained, not guessed at.** FFmpeg's stderr is
+  discarded by default; with `log_ffmpeg_stderr` (or `--log-ffmpeg-stderr` on the proxy) it is run
+  at `info` and its output logged, bounded to 20 lines and then a single suppression notice. It
+  also reports the detected payload transport (MPEG-PS, MPEG-TS, RTP or unknown) of the first
+  video packets. This is the first thing to turn on when a camera sends video but no MPEG-TS
+  comes out.
 - **Timestamps you can line up with other logs.** Every line carries an ISO-8601 local time to
   the millisecond, and each session reports `session opened`, `first-video` (the camera starting
   to send) and `first-byte` (the consumer starting to receive), so a wake-up can be measured
@@ -123,7 +129,8 @@ ezviz-stream-bridge --options ./options.json --token-file ./ezviz_token.json
   "password": "your-account-password",
   "region": "apiieu.ezvizlife.com",
   "cameras": [{ "serial": "BB1234567", "port": 8558 }],
-  "log_level": "info"
+  "log_level": "info",
+  "log_ffmpeg_stderr": false
 }
 ```
 
@@ -139,6 +146,7 @@ connection's lifecycle: `python -m ezviz_stream_bridge.proxy --help`. `--first-v
 sets the no-video budget (`0` disables it, restoring the pre-0.1.3 behaviour of waiting
 indefinitely), `--timeout-cooldown` sets how long a new session is withheld after a camera
 timeout (`0` disables it), and `--log-level debug` adds the consumer's request headers to the log.
+`--log-ffmpeg-stderr` captures FFmpeg's own diagnostics when a stream produces no output.
 
 ## Investigation tools
 

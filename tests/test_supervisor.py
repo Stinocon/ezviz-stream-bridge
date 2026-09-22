@@ -7,11 +7,17 @@ clean slate. None of these tests sleep -- the clock is injected.
 
 from __future__ import annotations
 
-from ezviz_stream_bridge.config import CameraConfig
+from pathlib import Path
+
+import pytest
+
+from ezviz_stream_bridge import supervisor as supervisor_module
+from ezviz_stream_bridge.config import BridgeConfig, CameraConfig
 from ezviz_stream_bridge.supervisor import (
     FIRST_BACKOFF,
     HEALTHY_AFTER,
     MAX_BACKOFF,
+    Supervisor,
     _Proxy,
 )
 
@@ -61,3 +67,49 @@ def test_healthy_threshold_is_longer_than_the_first_delay() -> None:
     # If it were not, a proxy that failed immediately could still be counted healthy
     # and the backoff would never grow.
     assert HEALTHY_AFTER > FIRST_BACKOFF
+
+
+class _FakeTokens:
+    """The supervisor only reads `.path` and calls `.ensure()`."""
+
+    path = Path("ezviz_token.json")
+
+    def ensure(self) -> None:
+        return None
+
+
+class _FakeProcess:
+    pid = 4321
+
+    def poll(self) -> int | None:
+        return None
+
+
+def _supervisor(*, log_ffmpeg_stderr: bool = False) -> Supervisor:
+    config = BridgeConfig.from_options(
+        {
+            "username": "user@example.com",
+            "password": "secret",
+            "region": "apiieu.ezvizlife.com",
+            "cameras": [{"serial": "BB1234567", "port": 8558}],
+            "log_ffmpeg_stderr": log_ffmpeg_stderr,
+        }
+    )
+    return Supervisor(config, _FakeTokens())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_ffmpeg_diagnostic_flag_reaches_the_proxy_command(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fake_popen(command: list[str]) -> _FakeProcess:
+        captured["command"] = command
+        return _FakeProcess()
+
+    monkeypatch.setattr(supervisor_module.subprocess, "Popen", fake_popen)
+    supervisor = _supervisor(log_ffmpeg_stderr=enabled)
+    supervisor._start(supervisor._proxies[0])
+
+    assert ("--log-ffmpeg-stderr" in captured["command"]) is enabled

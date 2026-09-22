@@ -13,6 +13,7 @@ to stdout so the forwarding path can be checked without a camera.
 
 from __future__ import annotations
 
+import logging
 import socket
 import threading
 import time
@@ -483,3 +484,138 @@ def test_abort_before_run_is_harmless() -> None:
     session = CloudSession(object(), "BB1234567")
     session.abort("client gone")
     assert session.abort_reason == "client gone"
+
+
+def _arg_recording_ffmpeg(
+    tmp_path: Path, *, stderr_lines: int, line_padding: int = 0
+) -> tuple[str, Path]:
+    """A fake remux that records its argv and emits a known number of stderr lines.
+
+    `printf '%s\n' "$@"` is the only way to observe the arguments FFmpeg was started
+    with, which is how the test checks that the level really was raised to `info`.
+    `line_padding` grows each line so a test can exceed the OS pipe buffer.
+    """
+    script = tmp_path / "noisy-ffmpeg"
+    args_file = tmp_path / "noisy-ffmpeg.args"
+    padding = "x" * line_padding
+    script.write_text(
+        "#!/bin/sh\n"
+        f'printf \'%s\\n\' "$@" > "{args_file}"\n'
+        "i=0\n"
+        f'while [ "$i" -lt {stderr_lines} ]; do\n'
+        f'  printf \'demux complaint %s {padding}\\n\' "$i" >&2\n'
+        "  i=$((i+1))\n"
+        "done\n"
+        "exec cat\n"
+    )
+    script.chmod(0o755)
+    return str(script), args_file
+
+
+def _loglevel_arg(args_file: Path) -> str:
+    args = args_file.read_text(encoding="utf-8").splitlines()
+    return args[args.index("-loglevel") + 1]
+
+
+def test_ffmpeg_stderr_is_captured_and_bounded(vtm, tmp_path, caplog) -> None:
+    """The diagnostic the issue asked for: FFmpeg's own words, not DEVNULL.
+
+    Bounded because a broken demux repeats one complaint per frame, and at `info`
+    because a remux stuck in its input probe says nothing at `error` -- the exact case
+    that has to be explained. The stderr is far larger than the OS pipe buffer, so the
+    test also proves the reader keeps draining after the logging bound: if it stopped,
+    the fake FFmpeg would block on the write and never reach `cat`.
+    """
+    caplog.set_level(logging.INFO)
+    ffmpeg_path, args_file = _arg_recording_ffmpeg(
+        tmp_path, stderr_lines=1000, line_padding=200
+    )
+    vtm([video(b"data")], silent_after=False)
+    session = CloudSession(
+        object(),
+        "BB1234567",
+        ffmpeg_path=ffmpeg_path,
+        first_video_timeout=0,
+        ffmpeg_stderr=True,
+        connection_id=7,
+    )
+    sink = Sink()
+    thread, errors = run_in_thread(session, sink)
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert _loglevel_arg(args_file) == "info"
+    assert bytes(sink.data) == b"data", "the fake FFmpeg blocked on stderr and never drained"
+
+    lines = [
+        record.getMessage() for record in caplog.records if "[FFmpeg]" in record.getMessage()
+    ]
+    complaints = [line for line in lines if "demux complaint" in line]
+    assert len(complaints) == session_module._FFMPEG_STDERR_MAX_LINES
+    assert any("further stderr suppressed" in line for line in lines)
+    assert any("payload #1 transport=" in line for line in lines)
+    assert all("conn=7" in line for line in lines)
+
+
+@pytest.mark.parametrize("capturing", [False, True])
+def test_stderr_pipe_matches_the_diagnostic_flag(fake_ffmpeg, capturing: bool) -> None:
+    """`DEVNULL` off, a pipe on -- the thing that distinguishes the two modes."""
+    session = CloudSession(
+        object(), "BB1234567", ffmpeg_path=fake_ffmpeg, ffmpeg_stderr=capturing
+    )
+    process = session._start_ffmpeg()
+    try:
+        assert (process.stderr is None) is not capturing
+    finally:
+        process.terminate()
+        process.wait(timeout=TEARDOWN_LIMIT)
+        if process.stderr is not None:
+            process.stderr.close()
+
+
+def test_stderr_capture_tears_down_with_a_live_ffmpeg(
+    vtm, stubborn_ffmpeg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The path where the reap-join-close ordering matters: the reader is blocked on a
+    live FFmpeg's stderr while the session aborts, and FFmpeg ignores the terminate."""
+    monkeypatch.setattr(session_module, "_WRITER_JOIN_TIMEOUT", 0.5)
+    monkeypatch.setattr(session_module, "_FFMPEG_REAP_TIMEOUT", 0.2)
+    made = vtm([], stream_class=WedgedVtmStream)
+    session = CloudSession(
+        object(),
+        "BB1234567",
+        ffmpeg_path=stubborn_ffmpeg.path,
+        first_video_timeout=0,
+        ffmpeg_stderr=True,
+    )
+    sink = Sink()
+    thread, errors = run_in_thread(session, sink)
+    assert made["stream"].iterating.wait(SETTLE)
+    assert stubborn_ffmpeg.wait_until_stubborn(SETTLE), "the stand-in never became stubborn"
+
+    try:
+        session.abort("client gone")
+        thread.join(timeout=TEARDOWN_LIMIT)
+
+        assert not thread.is_alive(), "a blocked stderr reader must not hold the session open"
+        assert errors == []
+        assert made["stream"].closed
+    finally:
+        made["stream"].release.set()
+
+
+def test_ffmpeg_stderr_is_discarded_by_default(vtm, tmp_path, caplog) -> None:
+    """Off by default: the level stays `error` and nothing is logged."""
+    caplog.set_level(logging.INFO)
+    ffmpeg_path, args_file = _arg_recording_ffmpeg(tmp_path, stderr_lines=5)
+    vtm([video(b"data")], silent_after=False)
+    session = CloudSession(object(), "BB1234567", ffmpeg_path=ffmpeg_path, first_video_timeout=0)
+    sink = Sink()
+    thread, errors = run_in_thread(session, sink)
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert _loglevel_arg(args_file) == "error"
+    assert not [r for r in caplog.records if "[FFmpeg]" in r.getMessage()]

@@ -34,7 +34,7 @@ from typing import Any, BinaryIO
 
 from pyezvizapi.cloud_stream import open_cloud_stream
 from pyezvizapi.exceptions import PyEzvizError
-from pyezvizapi.stream import VtmChannel
+from pyezvizapi.stream import VtmChannel, detect_transport
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -67,6 +67,21 @@ _FFMPEG_REAP_TIMEOUT = 2.0
 # anything else is a real remux failure worth reporting.
 _EXPECTED_FFMPEG_CODES = (0, -15)
 
+# When the diagnostic capture is on, FFmpeg is run at `info` rather than `error`. The
+# failure this exists to explain -- FFmpeg sitting in its input probe producing nothing --
+# logs nothing at `error`, so capturing stderr without raising the level would change
+# nothing. The bound is what keeps a remux that repeats the same complaint once per frame
+# from turning into a second failure: an unbounded log.
+_FFMPEG_LOG_LEVEL = "info"
+_FFMPEG_STDERR_MAX_LINES = 20
+_FFMPEG_STDERR_MAX_LINE = 500
+_FFMPEG_STDERR_JOIN_TIMEOUT = 2.0
+
+# How many leading video packets to classify when the diagnostic is on. One packet can
+# start mid-frame, so a few are sampled; the point is to answer "is this MPEG-PS at all?"
+# without waiting for FFmpeg.
+_PAYLOAD_SNIFF_PACKETS = 3
+
 
 @dataclass
 class SessionMetrics:
@@ -89,6 +104,8 @@ class CloudSession:
         *,
         ffmpeg_path: str = "ffmpeg",
         first_video_timeout: float = DEFAULT_FIRST_VIDEO_TIMEOUT,
+        ffmpeg_stderr: bool = False,
+        connection_id: int | None = None,
         on_event: Callable[[str, float], None] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -96,6 +113,8 @@ class CloudSession:
         self._serial = serial
         self._ffmpeg_path = ffmpeg_path
         self._first_video_timeout = first_video_timeout
+        self._ffmpeg_stderr = ffmpeg_stderr
+        self._connection_id = connection_id
         self._on_event = on_event
         self._now = monotonic
         self._started = monotonic()
@@ -148,6 +167,7 @@ class CloudSession:
 
         ffmpeg: subprocess.Popen[bytes] | None = None
         writer: threading.Thread | None = None
+        stderr_thread: threading.Thread | None = None
         deadline: threading.Timer | None = None
         try:
             stream.start()
@@ -162,6 +182,15 @@ class CloudSession:
                 # so stop it here instead of leaving it running.
                 with suppress(OSError):
                     ffmpeg.terminate()
+
+            if self._ffmpeg_stderr and ffmpeg.stderr is not None:
+                stderr_thread = threading.Thread(
+                    target=self._drain_ffmpeg_stderr,
+                    args=(ffmpeg.stderr,),
+                    name=f"ffmpeg-stderr-{self._serial}",
+                    daemon=True,
+                )
+                stderr_thread.start()
 
             if self._first_video_timeout > 0:
                 deadline = threading.Timer(self._first_video_timeout, self._on_deadline)
@@ -199,7 +228,15 @@ class CloudSession:
             with suppress(Exception):
                 stream.close()
 
+            # Reap first: once FFmpeg is dead its stderr write end closes, the drain
+            # thread sees EOF and exits on its own, and only then is it safe to close
+            # the read end underneath it.
             self._reap_ffmpeg(ffmpeg)
+            if stderr_thread is not None:
+                stderr_thread.join(timeout=_FFMPEG_STDERR_JOIN_TIMEOUT)
+            if ffmpeg is not None and ffmpeg.stderr is not None:
+                with suppress(OSError):
+                    ffmpeg.stderr.close()
 
         if self._writer_error is not None:
             raise self._writer_error
@@ -247,14 +284,20 @@ class CloudSession:
             sock.shutdown(socket.SHUT_RDWR)
 
     def _start_ffmpeg(self) -> subprocess.Popen[bytes]:
-        """Same remux as the library: MPEG-PS in, MPEG-TS out, no re-encoding."""
+        """Same remux as the library: MPEG-PS in, MPEG-TS out, no re-encoding.
+
+        Normally FFmpeg's stderr is discarded and its level kept at `error`. With the
+        diagnostic on it is piped and the level raised to `info`, so the reason a remux
+        produces nothing is visible instead of the process simply sitting there mute.
+        """
+        capturing = self._ffmpeg_stderr
         try:
             return subprocess.Popen(  # noqa: S603 - fixed argv, no shell
                 [
                     self._ffmpeg_path,
                     "-hide_banner",
                     "-loglevel",
-                    "error",
+                    _FFMPEG_LOG_LEVEL if capturing else "error",
                     "-f",
                     "mpeg",
                     "-i",
@@ -267,10 +310,44 @@ class CloudSession:
                 ],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE if capturing else subprocess.DEVNULL,
             )
         except OSError as err:
             raise PyEzvizError(f"Could not launch FFmpeg at {self._ffmpeg_path!r}: {err}") from err
+
+    def _label(self) -> str:
+        """Prefix that ties an FFmpeg line back to its camera and connection."""
+        if self._connection_id is None:
+            return f"serial={self._serial} "
+        return f"serial={self._serial} conn={self._connection_id} "
+
+    def _drain_ffmpeg_stderr(self, stderr: BinaryIO) -> None:
+        """Log FFmpeg's own diagnostics, bounded, so a silent remux is explainable.
+
+        Reading continues past the bound so FFmpeg never blocks on a full stderr pipe,
+        but logging stops: a broken demux can repeat one complaint once per frame, and
+        an unbounded log would be a second failure on top of the first.
+        """
+        shown = 0
+        suppressed = False
+        try:
+            for raw in iter(stderr.readline, b""):
+                if shown < _FFMPEG_STDERR_MAX_LINES:
+                    line = raw.decode("utf-8", "replace").rstrip()
+                    if len(line) > _FFMPEG_STDERR_MAX_LINE:
+                        line = line[:_FFMPEG_STDERR_MAX_LINE] + "..."
+                    _LOGGER.info("[FFmpeg] %s%s", self._label(), line)
+                    shown += 1
+                elif not suppressed:
+                    _LOGGER.info(
+                        "[FFmpeg] %s... further stderr suppressed (%d lines shown)",
+                        self._label(),
+                        shown,
+                    )
+                    suppressed = True
+        except (OSError, ValueError):
+            # The pipe was closed during teardown. That is the expected way out.
+            return
 
     def _pump_vtm_to_ffmpeg(self, stream: Any, ffmpeg: subprocess.Popen[bytes]) -> None:
         """VTM packets -> FFmpeg stdin, until the stream ends or the session aborts."""
@@ -294,6 +371,16 @@ class CloudSession:
                     )
                 if self.metrics.first_video_at is None:
                     self._record("first-video")
+                if self._ffmpeg_stderr and self.metrics.video_packets < _PAYLOAD_SNIFF_PACKETS:
+                    # Answers "is this MPEG-PS at all?" directly, so a transport mismatch
+                    # does not have to be inferred from FFmpeg's silence.
+                    _LOGGER.info(
+                        "[FFmpeg] %spayload #%d transport=%s head=%s",
+                        self._label(),
+                        self.metrics.video_packets + 1,
+                        detect_transport(packet.body).name,
+                        packet.body[:12].hex(" "),
+                    )
                 self.metrics.video_packets += 1
                 if packet.body:
                     stdin.write(packet.body)

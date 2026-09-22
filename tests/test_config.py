@@ -34,6 +34,21 @@ def test_defaults_are_filled_in() -> None:
     assert config.cameras[0].serial == "BB1234567"
     assert config.cameras[0].port == FIRST_PORT
     assert config.cameras[0].path == "/BB1234567.ts"
+    assert config.log_ffmpeg_stderr is False
+
+
+def test_log_ffmpeg_stderr_is_read_when_set() -> None:
+    config = BridgeConfig.from_options(_options(log_ffmpeg_stderr=True))
+
+    assert config.log_ffmpeg_stderr is True
+
+
+def test_log_ffmpeg_stderr_text_false_is_not_true() -> None:
+    # A hand-written options.json can carry the string. `bool("false")` is True, which
+    # is the trap this parsing exists to avoid.
+    config = BridgeConfig.from_options(_options(log_ffmpeg_stderr="false"))
+
+    assert config.log_ffmpeg_stderr is False
 
 
 def test_ports_are_assigned_in_order_when_omitted() -> None:
