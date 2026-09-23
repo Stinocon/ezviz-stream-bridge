@@ -26,6 +26,7 @@ from pyezvizapi.exceptions import PyEzvizError
 from pyezvizapi.stream import VtmChannel
 
 from ezviz_stream_bridge import session as session_module
+from ezviz_stream_bridge.rtp import H264, RtpDepacketizer
 from ezviz_stream_bridge.session import CloudSession, classify_payload
 
 # Generous: the teardown paths under test are meant to take milliseconds. These bounds
@@ -1003,6 +1004,101 @@ def test_packets_the_depacketizer_could_not_read_are_reported(
     assert any(
         "dropped 2 unreadable packet(s) and skipped 0" in message for message in messages
     )
+
+
+def test_the_payload_type_breakdown_says_what_was_discarded(
+    vtm, fake_ffmpeg, caplog
+) -> None:
+    """`skipped` says how much of another payload type was dropped and nothing about what it
+    was. A second media stream and more of the camera's metadata are the same number and
+    nothing alike in their bytes, and a stream that arrives without audio is exactly the case
+    where the count alone leaves the question open."""
+    caplog.set_level(logging.INFO)
+    vtm(
+        [
+            video(rtp_packet(b"\x67\x4d\x00\x32", payload_type=96)),
+            video(rtp_packet(b"", extension=bytes(48))),
+            video(rtp_packet(b"\xff\xf1\x50\x80", payload_type=112, sequence=0x6168)),
+            video(rtp_packet(b"\xff\xf1\x50\x80\x00", payload_type=112, sequence=0x6169)),
+        ],
+        silent_after=False,
+    )
+    session = CloudSession(
+        object(),
+        "BB1234567",
+        ffmpeg_path=fake_ffmpeg,
+        first_video_timeout=0,
+        ffmpeg_stderr=True,
+    )
+    thread, errors = run_in_thread(session, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert errors == []
+    lines = _diagnostic_lines(caplog)
+    assert any(
+        "payload type PT112: 3 packet(s), 2 carrying media, 1 with an empty payload, "
+        "payload 4..5 byte(s)" in line
+        for line in lines
+    ), "the extension-only packet belongs to its type, and to no media count"
+    detail = next(line for line in lines if "payload type PT112 first media packet:" in line)
+    assert "seq=0x6168" in detail, "the header of the first packet that carried media"
+    assert "ssrc=0x55667788" in detail
+    assert detail.endswith("payload=ff f1 50 80")
+
+
+def test_one_payload_type_is_not_reported(vtm, fake_ffmpeg, caplog) -> None:
+    """One payload type is the shape of a stream that works: the breakdown exists to explain a
+    second one, and printing the first on every session would be noise."""
+    caplog.set_level(logging.INFO)
+    vtm([video(rtp_packet(b"\x67\x4d\x00\x32", payload_type=96))], silent_after=False)
+    session = CloudSession(
+        object(),
+        "BB1234567",
+        ffmpeg_path=fake_ffmpeg,
+        first_video_timeout=0,
+        ffmpeg_stderr=True,
+    )
+    thread, errors = run_in_thread(session, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert errors == []
+    assert not any("payload type PT" in line for line in _diagnostic_lines(caplog))
+
+
+def test_the_breakdown_bytes_need_the_diagnostic_flag(vtm, fake_ffmpeg, caplog) -> None:
+    """The counts have to be visible without the flag -- a second stream dropped on the floor
+    is what the session is reporting, not a detail of it -- while the bytes are the diagnostic,
+    like the leading-packet dump they answer the same question as."""
+    caplog.set_level(logging.INFO)
+    vtm(
+        [
+            video(rtp_packet(b"\x67\x4d\x00\x32", payload_type=96)),
+            video(rtp_packet(b"\xff\xf1\x50\x80", payload_type=112)),
+        ],
+        silent_after=False,
+    )
+    session = CloudSession(object(), "BB1234567", ffmpeg_path=fake_ffmpeg, first_video_timeout=0)
+    thread, errors = run_in_thread(session, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert errors == []
+    lines = _diagnostic_lines(caplog)
+    assert any("payload type PT112: 1 packet(s), 1 carrying media" in line for line in lines)
+    assert not any("first media packet:" in line for line in lines)
+
+
+def test_a_depacketizer_without_a_payload_type_filter_reports_every_type(caplog) -> None:
+    """No session builds one -- in `_decide` a codec always comes with the payload type it was
+    named from -- so this is the contract the unit callers get rather than something a camera
+    depends on: with no elementary stream type to compare against, nothing here can tell a
+    foreign type from its own, and every type is reported."""
+    caplog.set_level(logging.INFO)
+    depacketizer = RtpDepacketizer(H264)
+    depacketizer.feed(rtp_packet(b"\x67\x4d\x00\x32", payload_type=96))
+
+    CloudSession(object(), "BB1234567")._report_payload_types(depacketizer)
+
+    assert any("payload type PT96" in line for line in _diagnostic_lines(caplog))
 
 
 def test_packet_dump_covers_the_leading_set(vtm, fake_ffmpeg, caplog) -> None:

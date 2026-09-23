@@ -188,6 +188,45 @@ def test_another_payload_type_is_not_this_elementary_stream() -> None:
     assert depacketizer.dropped == 0, "another payload type is not an unreadable packet"
 
 
+def test_the_breakdown_counts_every_type_the_unwrap_accepted() -> None:
+    """The skipped count says how much of another payload type was dropped and nothing about
+    what it was. These are the bytes that say: a packet whose extension consumes it is a packet
+    of its type and not of the elementary stream, and the first packet that carried media is the
+    one worth printing, because the ones before it are the ones that say nothing."""
+    depacketizer = RtpDepacketizer(H264, payload_type=96)
+
+    depacketizer.feed(PT112_WITH_EXTENSION)
+    depacketizer.feed(rtp_packet(b"\xff\xf1\x50\x80\x00", payload_type=112))
+    depacketizer.feed(rtp_packet(b"\x67\x4d\x00\x32", payload_type=96))
+
+    stats = {stat.payload_type: stat for stat in depacketizer.payload_types}
+    metadata = stats[112]
+    assert (metadata.packets, metadata.media) == (2, 1), "the empty packet is counted there"
+    assert (metadata.smallest, metadata.largest) == (5, 5)
+    assert metadata.payload == b"\xff\xf1\x50\x80\x00"
+    assert metadata.header[:2] == bytes([0x80, 112])
+    video = stats[96]
+    assert (video.packets, video.media) == (1, 1)
+    assert video.payload == bytes.fromhex("67 4d 00 32")
+
+
+def test_the_breakdown_is_ordered_by_volume() -> None:
+    """The type worth looking at is the one that carried the most packets, whatever its
+    number; and one type is still one entry, because "this session carried only the elementary
+    stream" is the answer that rules a second stream out."""
+    depacketizer = RtpDepacketizer(H264, payload_type=96)
+    depacketizer.feed(H264_SPS)
+    depacketizer.feed(PT112_WITH_EXTENSION)
+    depacketizer.feed(PT112_WITH_PROFILE_2)
+
+    assert [stat.payload_type for stat in depacketizer.payload_types] == [112, 96]
+
+    single = RtpDepacketizer(H264, payload_type=96)
+    single.feed(H264_SPS)
+    assert [stat.payload_type for stat in single.payload_types] == [96]
+    assert single.payload_types[0].header == H264_SPS[:12]
+
+
 def test_without_a_payload_type_nothing_is_filtered() -> None:
     """The type is only enforced when the caller knows it; a depacketizer built without one
     must not start inventing a filter of its own."""

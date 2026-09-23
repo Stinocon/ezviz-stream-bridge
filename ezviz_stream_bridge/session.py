@@ -95,6 +95,12 @@ _PREFIX_PACKETS = 8
 _PACKET_DUMP_HEAD = 64
 _PACKET_DUMP_PAYLOAD = 64
 
+# The payload-type breakdown is one line per type, plus one when the diagnostic adds the
+# packets' bytes. A session is expected to carry two or three types; the cap is what keeps a
+# sender that stamps a fresh type on every packet from turning a diagnostic into a flood. The
+# types past it are counted, and said to be counted, rather than printed.
+_PAYLOAD_TYPE_REPORT_MAX = 6
+
 # The demuxer FFmpeg reads MPEG-PS with. Anything else here is an elementary stream the
 # session has already depacketized, and the name is the codec.
 _MPEG_PS_DEMUXER = "mpeg"
@@ -205,7 +211,10 @@ def _describe_rtp_header(body: bytes) -> str:
     The twelve fixed bytes only, so the reading is the one the specification gives and not
     an interpretation: X, CC and P decide where the payload starts and how much of its tail is
     padding, which is the whole point of printing them -- with X set and a length of 12 words,
-    the media begins at byte 64 and no 24-byte head could have shown it.
+    the media begins at byte 64 and no 24-byte head could have shown it. The SSRC is here for
+    the same reason: two payload types can share one synchronisation source and still number
+    their packets separately, and which of the two this is decides how to read the rest of a
+    session that carries more than one.
     """
     if len(body) < _RTP_HEADER_BYTES or (body[0] & _RTP_VERSION_MASK) != _RTP_VERSION_2:
         return "none"
@@ -213,7 +222,8 @@ def _describe_rtp_header(body: bytes) -> str:
         f"V{body[0] >> 6} P{(body[0] >> 5) & 1} X{(body[0] >> 4) & 1} CC{body[0] & 0x0F} "
         f"M{body[1] >> 7} PT{body[1] & 0x7F} "
         f"seq=0x{int.from_bytes(body[2:4], 'big'):04x} "
-        f"ts=0x{int.from_bytes(body[4:8], 'big'):08x}"
+        f"ts=0x{int.from_bytes(body[4:8], 'big'):08x} "
+        f"ssrc=0x{int.from_bytes(body[8:12], 'big'):08x}"
     )
 
 
@@ -730,20 +740,70 @@ class CloudSession:
                 # A fragment whose end never arrived is media that did not make it out, and it
                 # belongs in the counts below rather than in silence.
                 depacketizer.flush()
-            if depacketizer is not None and (depacketizer.dropped or depacketizer.skipped):
-                # The difference between "the camera sent nothing" and "the camera sent
-                # something this bridge misread" is the whole reason these counts exist.
-                _LOGGER.warning(
-                    "[FFmpeg] %sthe %s depacketizer dropped %d unreadable packet(s) and "
-                    "skipped %d carrying another RTP payload type",
-                    self._label(),
-                    depacketizer.codec,
-                    depacketizer.dropped,
-                    depacketizer.skipped,
-                )
+                self._report_payload_types(depacketizer)
+                if depacketizer.dropped or depacketizer.skipped:
+                    # The difference between "the camera sent nothing" and "the camera sent
+                    # something this bridge misread" is the whole reason these counts exist.
+                    _LOGGER.warning(
+                        "[FFmpeg] %sthe %s depacketizer dropped %d unreadable packet(s) and "
+                        "skipped %d carrying another RTP payload type",
+                        self._label(),
+                        depacketizer.codec,
+                        depacketizer.dropped,
+                        depacketizer.skipped,
+                    )
             # EOF for FFmpeg, which is what ends a session that stopped on its own.
             with suppress(OSError):
                 stdin.close()
+
+    def _report_payload_types(self, depacketizer: RtpDepacketizer) -> None:
+        """Log what each RTP payload type carried, for a session that carried more than one.
+
+        The count of the payload type that is not the elementary stream says how much was
+        discarded and nothing about what it was, and those are different faults: a second media
+        stream dropped on the floor is a stream to go and read, more of the camera's metadata is
+        the session working as intended. The count of packets carrying media is the first thing
+        that separates them, and the first bytes of each type's media are what names it.
+
+        A session whose only payload type is the elementary stream's own says nothing: that is
+        the shape of every stream that works, and printing it once per session would be noise.
+        The bytes are behind the diagnostic flag, like the leading-packet dump that answers the
+        same question about the start of a session; the counts are not, because a discarded
+        second stream has to be visible without one.
+        """
+        stats = depacketizer.payload_types
+        own = depacketizer.payload_type
+        if own is not None and all(stat.payload_type == own for stat in stats):
+            # Only the type the codec was named from. Without one -- a depacketizer built
+            # without a filter -- there is nothing to compare against, and every type it saw is
+            # one the caller does not already know about, so it is reported.
+            return
+        for stat in stats[:_PAYLOAD_TYPE_REPORT_MAX]:
+            sizes = f", payload {stat.smallest}..{stat.largest} byte(s)" if stat.media else ""
+            _LOGGER.info(
+                "[FFmpeg] %spayload type PT%s: %d packet(s), %d carrying media, "
+                "%d with an empty payload%s",
+                self._label(),
+                stat.payload_type,
+                stat.packets,
+                stat.media,
+                stat.packets - stat.media,
+                sizes,
+            )
+            if self._ffmpeg_stderr and stat.payload:
+                _LOGGER.info(
+                    "[FFmpeg] %spayload type PT%s first media packet: %s payload=%s",
+                    self._label(),
+                    stat.payload_type,
+                    _describe_rtp_header(stat.header),
+                    stat.payload.hex(" "),
+                )
+        if len(stats) > _PAYLOAD_TYPE_REPORT_MAX:
+            _LOGGER.info(
+                "[FFmpeg] %s%d further payload type(s) not shown",
+                self._label(),
+                len(stats) - _PAYLOAD_TYPE_REPORT_MAX,
+            )
 
     def _pump_ffmpeg_to_consumer(self, ffmpeg: subprocess.Popen[bytes], output: BinaryIO) -> None:
         """FFmpeg stdout -> the consumer, until EOF or the session is cancelled.

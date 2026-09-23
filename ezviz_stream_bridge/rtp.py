@@ -20,6 +20,8 @@ of has to be visible as a number, not as silence.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from pyezvizapi.exceptions import PyEzvizError
 from pyezvizapi.stream import rtp_payload
 
@@ -77,6 +79,34 @@ _RTP_VERSION = 2
 # A NAL this large is not one these cameras send, and the bound is what keeps a stream that
 # never signals the end of a fragment from growing without limit.
 _MAX_NAL_BYTES = 4 * 1024 * 1024
+
+# Payload bytes kept per type for the breakdown. Enough to name a codec from its own header --
+# an ADTS frame, a G.711 sample, a NAL unit -- and not enough to keep a packet.
+_SAMPLE_BYTES = 32
+
+
+@dataclass
+class PayloadTypeStat:
+    """What one RTP payload type carried over a session, as far as the depacketizer saw it.
+
+    One RTP session can carry more than one payload type, and the count of the one that is not
+    the elementary stream says only how much was discarded, not what it was. These are the
+    fields that tell a second media stream apart from more of the first one's metadata: how
+    many of its packets carried anything at all, how large those payloads were, which sequence
+    numbers they arrived under -- a stream of its own numbers them separately even when it
+    shares the SSRC, as the CS-C8c's metadata does not -- and what their first bytes are.
+
+    `RtpDepacketizer` owns the instances and updates them as packets arrive; `payload_types`
+    hands them out for reporting.
+    """
+
+    payload_type: int | None
+    packets: int = 0
+    media: int = 0  # of `packets`, the ones that carried payload bytes
+    smallest: int = 0  # of those payloads, the shortest ...
+    largest: int = 0  # ... and the longest
+    header: bytes = b""  # the twelve fixed bytes of the first packet that carried media
+    payload: bytes = b""  # the first media bytes of this type, capped at `_SAMPLE_BYTES`
 
 
 def _detect_parameter_set(unit: bytes) -> str | None:
@@ -196,7 +226,21 @@ class RtpDepacketizer:
         # can report the numbers once, at its end.
         self.dropped = 0
         self.skipped = 0
+        # Per payload type, not per packet: at most 128 keys, one per type the seven-bit field
+        # can hold, so the memory this takes is bounded by the protocol rather than by the
+        # stream.
+        self._types: dict[int | None, PayloadTypeStat] = {}
         self._fragment: bytearray | None = None
+
+    @property
+    def payload_types(self) -> tuple[PayloadTypeStat, ...]:
+        """One entry per payload type fed to this depacketizer, the busiest first.
+
+        By volume rather than by type number: whether a second stream is here is a question
+        about the type that carried most of the packets, not about the smallest number on the
+        wire. Ties keep the order the types were first seen in.
+        """
+        return tuple(sorted(self._types.values(), key=lambda stat: -stat.packets))
 
     def feed(self, packet: bytes) -> bytes:
         """The Annex-B bytes one RTP packet contributes, empty when it contributes none."""
@@ -206,6 +250,12 @@ class RtpDepacketizer:
             # Not an RTP packet, or a header that overruns it: nothing to unwrap.
             self.dropped += 1
             return b""
+        # Before the branch below, so the breakdown sees every packet the unwrap accepted: an
+        # empty payload is still a packet of its type, and "this type arrives with a header
+        # extension and nothing else" is half of what the breakdown exists to say. The type is
+        # read here rather than in the unwrap because a header the unwrap rejects is a drop
+        # above, not a payload type this session has to report on.
+        self._account(_payload_type(packet), packet, payload)
         if not payload:
             # A packet with metadata in its header extension and no media at all. The CS-C8c
             # sends two of these before its first NAL; they are not an error, not video, and
@@ -340,6 +390,27 @@ class RtpDepacketizer:
         if self._fragment is not None:
             self._fragment = None
             self._drop()
+
+    def _account(self, payload_type: int | None, packet: bytes, payload: bytes) -> None:
+        """Count one packet under its payload type, keeping the first bytes of each kind."""
+        stat = self._types.get(payload_type)
+        if stat is None:
+            stat = PayloadTypeStat(payload_type)
+            self._types[payload_type] = stat
+        stat.packets += 1
+        if not payload:
+            return
+        # The first packet that carried media, not the first packet of the type: an entry is
+        # read to ask what the type is, and a type whose opening packets are metadata has to be
+        # described by the first bytes that were meant for a decoder.
+        if not stat.header:
+            stat.header = packet[:_RTP_HEADER_BYTES]
+        size = len(payload)
+        stat.smallest = size if stat.media == 0 else min(stat.smallest, size)
+        stat.largest = max(stat.largest, size)
+        stat.media += 1
+        if not stat.payload:
+            stat.payload = payload[:_SAMPLE_BYTES]
 
     def _drop(self) -> None:
         self.dropped += 1

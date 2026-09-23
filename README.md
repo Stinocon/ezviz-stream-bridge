@@ -115,7 +115,14 @@ This project is the part that has to keep working for weeks unattended:
   session, because the decision has to happen before FFmpeg exists.
 - **A stream that produces nothing now says which of the two it is.** A payload that is
   RTP with no H.264 or HEVC parameter set to name it, and packets the depacketizer cannot
-  read, are counted and logged rather than left as a bare `bytes=0`.
+  read, are counted and logged rather than left as a bare `bytes=0`. One RTP session can
+  carry more than one payload type — the CS-C8c sends its metadata alongside its video — and
+  the count of what was skipped does not say what it was, so a session that saw a second type
+  also reports what each type carried: how many packets, how many of them held media at all,
+  and the size range of those payloads. Up to six types are printed, with a count of any
+  beyond that. With the diagnostic on it adds the RTP header and the first bytes of each
+  type's first media packet, which is what names a codec. Audio multiplexed into the same
+  session has to show up here; so does the case where those packets were metadata all along.
 - **A remux that produces nothing can be explained, not guessed at.** FFmpeg's stderr is
   discarded by default; with `log_ffmpeg_stderr` (or `--log-ffmpeg-stderr` on the proxy) it is run
   at `info` and its output logged, bounded to 20 lines and then a single suppression notice. It
@@ -174,7 +181,8 @@ sets the no-video budget (`0` disables it, restoring the pre-0.1.3 behaviour of 
 indefinitely), `--timeout-cooldown` sets how long a new session is withheld after a camera
 timeout (`0` disables it), and `--log-level debug` adds the consumer's request headers to the log.
 `--log-ffmpeg-stderr` captures FFmpeg's own diagnostics when a stream produces no output, and with
-it the leading packets of any payload that is not MPEG-PS.
+it the leading packets of any payload that is not MPEG-PS, and — for a session that carries more
+than one RTP payload type — the first bytes of each type's first media packet, up to six types.
 
 ## Investigation tools
 
