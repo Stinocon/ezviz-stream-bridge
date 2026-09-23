@@ -27,7 +27,7 @@ import socket
 import subprocess
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, BinaryIO
@@ -35,6 +35,8 @@ from typing import Any, BinaryIO
 from pyezvizapi.cloud_stream import open_cloud_stream
 from pyezvizapi.exceptions import PyEzvizError
 from pyezvizapi.stream import VtmChannel, rtp_payload
+
+from .rtp import RtpDepacketizer, detect_codec
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -77,30 +79,25 @@ _FFMPEG_STDERR_MAX_LINES = 20
 _FFMPEG_STDERR_MAX_LINE = 500
 _FFMPEG_STDERR_JOIN_TIMEOUT = 2.0
 
-# When the diagnostic capture is on, the transport sniff buffers a bounded prefix of the
-# video payload and looks for a real signature in it. It does not classify each packet's
-# first byte: VTM packets are arbitrary chunks of the byte stream, so a packet can start
-# mid-pack and hand the sniff a mid-stream byte that reads as RTP -- which is what the first
-# version did, and it looked like a fault. The prefix is scanned once enough of it is in hand
-# that a signature has to be present, and once more if the stream ends first.
-_PAYLOAD_SNIFF_BYTES = 8192
-_PAYLOAD_SNIFF_PACKETS = 8
+# Every session reads the leading video packets before it starts FFmpeg, because the demuxer
+# depends on what they are: the same camera family sends either MPEG-PS or RTP, and FFmpeg has
+# no single input format that reads both. The prefix is what the transport is classified from,
+# and one packet's first byte cannot say -- a VTM packet may begin mid-pack, and a mid-stream
+# byte that reads as RTP is exactly what 0.1.5's per-packet check kept reporting as a fault.
+# It is bounded by the VTM framing itself: a 16-bit length, so under 64 KiB per packet.
+_PREFIX_PACKETS = 8
 
-# The transport line above answers "what is this payload?" with the first 24 bytes. For a
-# payload the remux does not expect, that is not enough to answer the next question -- where
-# does the video actually start, and what codec is it? An RTP header is 12 bytes plus up to 60
-# bytes of CSRC list plus a variable-length extension, so the media can begin well past byte
-# 24 and a 24-byte head says nothing about it. These bound a per-packet dump that does answer
-# it: the first packets of the session, each with its header decoded and its payload sliced
-# out at the offset pyezvizapi's own unwrap computes.
-#
-# The whole body is kept, not a leading slice of it: `rtp_payload` reads the padding count
-# from the last byte of the packet, so a truncated copy would strip a byte count taken from
-# the middle of the media and report an offset that is simply wrong. The bodies are bounded
-# by the VTM framing itself -- a 16-bit length, so under 64 KiB each, eight of them at most.
-_PACKET_DUMP_PACKETS = 8
+# The transport line answers "what is this payload?" with the first 24 bytes. For a payload the
+# remux cannot use, that is not enough to answer the next question -- where does the video
+# actually start, and what codec is it? An RTP header is 12 bytes plus up to 60 bytes of CSRC
+# list plus a variable-length extension, so the media can begin well past byte 24 and a 24-byte
+# head says nothing about it. These bound the per-packet dump that answers it.
 _PACKET_DUMP_HEAD = 64
 _PACKET_DUMP_PAYLOAD = 64
+
+# The demuxer FFmpeg reads MPEG-PS with. Anything else here is an elementary stream the
+# session has already depacketized, and the name is the codec.
+_MPEG_PS_DEMUXER = "mpeg"
 
 # MPEG-PS pack_start_code. The byte after `00 00 01` is 0xBA, whose top bit is set -- the
 # forbidden_zero_bit of an H.264/H.265 NAL header -- so it cannot be a valid NAL, and a
@@ -155,6 +152,53 @@ def classify_payload(data: bytes) -> tuple[str, int]:
     return "UNKNOWN", -1
 
 
+def _codec_of(body: bytes) -> str | None:
+    """The codec a video packet's payload names, if it names one."""
+    try:
+        return detect_codec(rtp_payload(body))
+    except PyEzvizError:
+        return None
+
+
+def _payload_type_of(body: bytes) -> int | None:
+    """The RTP payload type of a packet body, or None when it is not an RTP header."""
+    if len(body) < _RTP_HEADER_BYTES or (body[0] & _RTP_VERSION_MASK) != _RTP_VERSION_2:
+        return None
+    return body[1] & 0x7F
+
+
+def _carries_media(body: bytes) -> bool:
+    """True when a video packet holds anything besides headers.
+
+    A non-empty body is not enough to call it video. The CS-C8c opens a session with two
+    payload-type-112 packets that are 64 and 44 bytes long and carry no media at all -- their
+    header extension consumes the whole packet -- and taking those for video would disarm the
+    no-video budget for a camera that then sent nothing else, which is the one case that budget
+    exists for.
+    """
+    if not body:
+        return False
+    if len(body) >= _RTP_HEADER_BYTES and (body[0] & _RTP_VERSION_MASK) == _RTP_VERSION_2:
+        try:
+            return bool(rtp_payload(body))
+        except PyEzvizError:
+            # An RTP-shaped header the unwrap rejects is still something the camera sent.
+            return True
+    return True
+
+
+def _forward(
+    stdin: BinaryIO, depacketizer: RtpDepacketizer | None, body: bytes
+) -> None:
+    """Write one video packet to FFmpeg, depacketizing it when the payload is RTP."""
+    if not body:
+        return
+    chunk = depacketizer.feed(body) if depacketizer is not None else body
+    if chunk:
+        stdin.write(chunk)
+        stdin.flush()
+
+
 def _describe_rtp_header(body: bytes) -> str:
     """Decode the fixed RTP header fields, or say that the bytes are not one.
 
@@ -171,6 +215,23 @@ def _describe_rtp_header(body: bytes) -> str:
         f"seq=0x{int.from_bytes(body[2:4], 'big'):04x} "
         f"ts=0x{int.from_bytes(body[4:8], 'big'):08x}"
     )
+
+
+@dataclass(frozen=True)
+class _PayloadPlan:
+    """What the leading video packets are, and how FFmpeg has to be started to read them.
+
+    `demuxer` is the FFmpeg input format. For an RTP payload it is the codec itself: the
+    session depacketizes to Annex-B, so there is no RTP left for FFmpeg to read. `codec` and
+    `payload_type` are None unless that depacketization is needed; the payload type is the one
+    the codec was identified from, so nothing else on the same RTP session is mistaken for it.
+    """
+
+    transport: str
+    demuxer: str
+    codec: str | None
+    payload_type: int | None
+    packets: tuple[bytes, ...]
 
 
 @dataclass
@@ -213,12 +274,6 @@ class CloudSession:
 
         self._lock = threading.Lock()
         self._cancel = threading.Event()
-        self._sniff_buffer = bytearray()
-        self._sniff_packets = 0
-        self._sniffed = False
-        self._dump_bodies: list[bytes] = []
-        self._dumped = False
-        self._transport: str | None = None
         self._abort_reason: str | None = None
         self._socket: socket.socket | None = None
         self._ffmpeg: subprocess.Popen[bytes] | None = None
@@ -269,33 +324,27 @@ class CloudSession:
             stream.start()
             self._record("opened")
 
-            ffmpeg = self._start_ffmpeg()
-            with self._lock:
-                self._ffmpeg = ffmpeg
-                cancelled = self._cancel.is_set()
-            if cancelled:
-                # Aborted while FFmpeg was starting: abort() could not see this process,
-                # so stop it here instead of leaving it running.
-                with suppress(OSError):
-                    ffmpeg.terminate()
-
-            if self._ffmpeg_stderr and ffmpeg.stderr is not None:
-                stderr_thread = threading.Thread(
-                    target=self._drain_ffmpeg_stderr,
-                    args=(ffmpeg.stderr,),
-                    name=f"ffmpeg-stderr-{self._serial}",
-                    daemon=True,
-                )
-                stderr_thread.start()
-
+            # The no-video budget is armed before the prefix is read, not after FFmpeg starts:
+            # a camera that sends nothing at all has to be given up on while that read is in
+            # progress, or the budget would begin counting only once it had already elapsed.
             if self._first_video_timeout > 0:
                 deadline = threading.Timer(self._first_video_timeout, self._on_deadline)
                 deadline.daemon = True
                 deadline.start()
 
+            # Before FFmpeg, because the leading packets decide its demuxer and no input
+            # format reads both MPEG-PS and a raw elementary stream.
+            plan, packets = self._read_prefix(stream)
+            if self._cancel.is_set():
+                # Aborted while the prefix was being read -- a consumer that left, or the
+                # no-video budget. There is nothing to remux and no process to start.
+                return
+
+            ffmpeg, stderr_thread = self._launch_remux(plan)
+
             writer = threading.Thread(
                 target=self._pump_vtm_to_ffmpeg,
-                args=(stream, ffmpeg),
+                args=(packets, ffmpeg, plan),
                 name=f"vtm-{self._serial}",
                 daemon=True,
             )
@@ -379,37 +428,73 @@ class CloudSession:
         with suppress(OSError):
             sock.shutdown(socket.SHUT_RDWR)
 
-    def _start_ffmpeg(self) -> subprocess.Popen[bytes]:
-        """Same remux as the library: MPEG-PS in, MPEG-TS out, no re-encoding.
+    def _start_ffmpeg(self, demuxer: str) -> subprocess.Popen[bytes]:
+        """MPEG-TS out of whatever the camera sent, with no re-encoding.
+
+        Two input formats are possible. MPEG-PS is the case this was built for and FFmpeg
+        demuxes it directly with `mpeg`. RTP is not, and no demuxer reads it out of a pipe --
+        `rtp` wants a UDP URL and an SDP -- so by the time FFmpeg is started the session has
+        depacketized to Annex-B and the demuxer names the elementary stream it is receiving,
+        `h264` or `hevc`.
+
+        `-use_wallclock_as_timestamps` is what makes that second case work at all: a raw
+        elementary stream has no container to carry a timestamp, and without one the MPEG-TS
+        muxer refuses the packet outright -- `first pts and dts value must be set`, zero bytes
+        written, for H.264 and HEVC alike. Wallclock is the packet's arrival time, which for a
+        live stream is the right reading anyway.
 
         Normally FFmpeg's stderr is discarded and its level kept at `error`. With the
         diagnostic on it is piped and the level raised to `info`, so the reason a remux
         produces nothing is visible instead of the process simply sitting there mute.
         """
         capturing = self._ffmpeg_stderr
+        argv = [
+            self._ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            _FFMPEG_LOG_LEVEL if capturing else "error",
+        ]
+        if demuxer != _MPEG_PS_DEMUXER:
+            argv += ["-use_wallclock_as_timestamps", "1"]
+        argv += ["-f", demuxer, "-i", "pipe:0", "-c", "copy", "-f", "mpegts", "pipe:1"]
         try:
             return subprocess.Popen(  # noqa: S603 - fixed argv, no shell
-                [
-                    self._ffmpeg_path,
-                    "-hide_banner",
-                    "-loglevel",
-                    _FFMPEG_LOG_LEVEL if capturing else "error",
-                    "-f",
-                    "mpeg",
-                    "-i",
-                    "pipe:0",
-                    "-c",
-                    "copy",
-                    "-f",
-                    "mpegts",
-                    "pipe:1",
-                ],
+                argv,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE if capturing else subprocess.DEVNULL,
             )
         except OSError as err:
             raise PyEzvizError(f"Could not launch FFmpeg at {self._ffmpeg_path!r}: {err}") from err
+
+    def _launch_remux(
+        self, plan: _PayloadPlan
+    ) -> tuple[subprocess.Popen[bytes], threading.Thread | None]:
+        """Start FFmpeg for this payload, plus the reader that drains its stderr.
+
+        Two details that have to happen here and not at the call site: the process is
+        registered under the lock so a concurrent `abort()` can terminate it, and if the
+        cancel flag was already set while FFmpeg was starting then `abort()` could not see
+        the process at all, so it is stopped here instead of being left running.
+        """
+        ffmpeg = self._start_ffmpeg(plan.demuxer)
+        with self._lock:
+            self._ffmpeg = ffmpeg
+            cancelled = self._cancel.is_set()
+        if cancelled:
+            with suppress(OSError):
+                ffmpeg.terminate()
+
+        if not (self._ffmpeg_stderr and ffmpeg.stderr is not None):
+            return ffmpeg, None
+        stderr_thread = threading.Thread(
+            target=self._drain_ffmpeg_stderr,
+            args=(ffmpeg.stderr,),
+            name=f"ffmpeg-stderr-{self._serial}",
+            daemon=True,
+        )
+        stderr_thread.start()
+        return ffmpeg, stderr_thread
 
     def _label(self) -> str:
         """Prefix that ties an FFmpeg line back to its camera and connection."""
@@ -445,56 +530,124 @@ class CloudSession:
             # The pipe was closed during teardown. That is the expected way out.
             return
 
-    def _sniff_payload(self, body: bytes) -> None:
-        """Buffer the leading payload and classify its transport once.
+    def _read_prefix(self, stream: Any) -> tuple[_PayloadPlan, Iterator[Any]]:
+        """Read the leading video packets and decide how FFmpeg has to read them.
 
-        Deferred until enough of the prefix is in hand that a signature has to be present,
-        which is what makes the answer independent of where the VTM packet boundaries fell.
+        Returns the plan and the packet iterator it stopped in the middle of, which the pump
+        resumes. One pass over the stream and one iterator: a second `iter_packets` call would
+        work against the socket, but it would also restart the keepalive clock and leave the
+        invariant "the stream is read once" to whichever library version is installed.
+
+        `include_control=True` for the same reason the pump uses it: while the camera sleeps
+        the only traffic is control packets, and without surfacing them this read would sit
+        inside the iterator, out of reach of the cancel flag.
+
+        It stops at `_PREFIX_PACKETS` bodies, or sooner if the stream ends, the session is
+        aborted, or the camera falls silent long enough for the VTM socket to time out. A
+        short prefix is still classified: a session that ended is explained by what it sent.
         """
-        if not self._ffmpeg_stderr or not body:
-            return
-        if (
-            not self._dumped
-            and self._transport != "MPEG_PS"
-            and len(self._dump_bodies) < _PACKET_DUMP_PACKETS
-        ):
-            self._dump_bodies.append(body)
-        if self._sniffed:
-            # The verdict is already out; the dump is complete the moment the last of the
-            # leading packets is in hand, and until then there is nothing more to say.
-            self._flush_dump(complete_only=True)
-            return
-        self._sniff_buffer.extend(body)
-        self._sniff_packets += 1
-        if (
-            len(self._sniff_buffer) < _PAYLOAD_SNIFF_BYTES
-            and self._sniff_packets < _PAYLOAD_SNIFF_PACKETS
-        ):
-            return
-        self._report_transport()
+        packets: list[bytes] = []
+        packets_iter = stream.iter_packets(include_control=True)
+        try:
+            for packet in packets_iter:
+                if self._cancel.is_set():
+                    break
+                body = self._accept(packet)
+                if body is None:
+                    continue
+                if body:
+                    packets.append(body)
+                if len(packets) >= _PREFIX_PACKETS:
+                    break
+        except Exception:
+            # A shut-down socket surfaces here as a DeviceException or an OSError, which is
+            # how abort() stops this read: an outcome, not a failure. With nothing aborted,
+            # it is a real error and belongs to the caller.
+            if not self._cancel.is_set():
+                raise
 
-    def _flush_sniff(self) -> None:
-        """Report whatever prefix was buffered when the stream ended mid-sniff.
+        prefix = tuple(packets)
+        if self._ffmpeg_stderr:
+            # Before the decision, not after: a payload whose codec cannot be named is
+            # precisely the one whose bytes somebody needs to see.
+            self._report_prefix(prefix)
+        if self._cancel.is_set():
+            # Aborted mid-read -- a consumer that left, or the no-video budget. What arrived
+            # is reported above, but there is no demuxer to choose: nobody is waiting for it,
+            # and "the payload names no codec" would be a misleading way to say so.
+            return _PayloadPlan("UNKNOWN", _MPEG_PS_DEMUXER, None, None, prefix), packets_iter
+        return self._decide(prefix), packets_iter
 
-        The dump here is not held back for a full set of packets: a session that ended after
-        three of them is still explained by those three.
+    def _decide(self, packets: tuple[bytes, ...]) -> _PayloadPlan:
+        """Name the transport, and with it the demuxer FFmpeg will be started with.
+
+        MPEG-PS keeps the demuxer it has always had. RTP is depacketized here, so FFmpeg is
+        told which elementary stream it is getting -- and which one that is comes from the
+        parameter set the stream opens with, never from a guess about the framing.
+
+        RTP with no parameter set in the leading packets stays on the `mpeg` demuxer, which is
+        what the bridge did before this path existed: FFmpeg will produce nothing from it, but
+        the warning says so plainly, and a session is not refused over a payload the bridge
+        merely failed to recognise. The transport can be read wrong in one direction -- a first
+        byte carrying RTP's version bits is not rare -- and refusing to serve a stream that
+        would have worked is worse than serving one that produces nothing.
         """
-        if not self._ffmpeg_stderr:
-            return
-        if not self._sniffed and self._sniff_buffer:
-            self._report_transport()
-        self._flush_dump()
+        data = b"".join(packets)
+        transport = classify_payload(data)[0] if data else "UNKNOWN"
+        if transport != "RTP":
+            return _PayloadPlan(transport, _MPEG_PS_DEMUXER, None, None, packets)
 
-    def _report_transport(self) -> None:
-        """Classify the buffered prefix and log it once, with where its signature sits."""
-        data = bytes(self._sniff_buffer)
-        if not data:
-            # Nothing to classify yet (only empty bodies so far); keep waiting rather than
-            # logging an empty UNKNOWN and locking the sniff.
-            return
-        self._sniffed = True
-        transport, offset = classify_payload(data)
-        self._transport = transport
+        codec = None
+        payload_type = None
+        for body in packets:
+            codec = _codec_of(body)
+            if codec is not None:
+                payload_type = _payload_type_of(body)
+                break
+        if codec is None:
+            _LOGGER.warning(
+                "[FFmpeg] %spayload transport=RTP but none of the first %d video packets "
+                "carries an H.264 or HEVC parameter set; leaving it to FFmpeg's `%s` demuxer, "
+                "which cannot read an RTP stream",
+                self._label(),
+                len(packets),
+                _MPEG_PS_DEMUXER,
+            )
+            return _PayloadPlan(transport, _MPEG_PS_DEMUXER, None, None, packets)
+        return _PayloadPlan(transport, codec, codec, payload_type, packets)
+
+    def _accept(self, packet: Any) -> bytes | None:
+        """Check one VTM packet, and return its body when it is video.
+
+        None means the packet was not on a video channel; an empty body means it was a video
+        packet with nothing in it. Two things happen here rather than at each of the two call
+        sites -- the prefix read and the pump -- because they must happen the same way in both:
+        a video packet is counted once, and `first-video` is recorded once, on the first packet
+        that actually carries media.
+        """
+        if packet.channel not in _STREAM_CHANNELS:
+            return None
+        if packet.encrypted:
+            raise PyEzvizError(
+                "Received an encrypted VTM stream packet; media decryption is not implemented"
+            )
+        self.metrics.video_packets += 1
+        body = packet.body
+        if self.metrics.first_video_at is None and body and _carries_media(body):
+            self._record("first-video")
+        return body
+
+    def _report_prefix(self, packets: tuple[bytes, ...]) -> None:
+        """Log what the leading packets are, and where the video starts in them.
+
+        Diagnostic only -- the decision is made either way -- and for a payload the remux
+        cannot use the packets are printed one by one. An RTP header is 12 bytes plus up to 60
+        bytes of CSRC list plus a variable-length extension, so the media can begin well past
+        what a 24-byte head shows; a few consecutive packets are what answers "where does the
+        video start, and what codec is it".
+        """
+        data = b"".join(packets)
+        transport, offset = classify_payload(data) if data else ("UNKNOWN", -1)
         _LOGGER.info(
             "[FFmpeg] %spayload transport=%s at offset=%d head=%s",
             self._label(),
@@ -502,34 +655,10 @@ class CloudSession:
             offset,
             data[:24].hex(" "),
         )
-        self._flush_dump(complete_only=True)
-
-    def _flush_dump(self, *, complete_only: bool = False) -> None:
-        """Log the leading packets individually, for a payload the remux cannot use.
-
-        Only when the transport is not MPEG-PS: a PS stream needs none of this, and FFmpeg
-        identifies its codec on its own, so the noise would buy nothing. For anything else
-        the open question is exactly where the video starts and what codec it is, and both
-        are answered by a few consecutive packets, each with its header fields, its leading
-        bytes, and the payload sliced out at the offset pyezvizapi's `rtp_payload` computes.
-        That the offset is computed by the library's function and not here is the point: it
-        is the same unwrap a fix would use, so the log shows what it would produce.
-
-        `complete_only` is what keeps "the first eight packets" from meaning "however many had
-        arrived when the verdict did": the byte threshold can fire on the third packet, and a
-        dump taken then would answer the question with the least evidence available. The
-        verdict itself is never held back -- only the packet dump is.
-        """
-        if self._dumped or self._transport is None or not self._dump_bodies:
+        if transport == "MPEG_PS":
+            # FFmpeg identifies a PS codec on its own, so the dump would only be noise.
             return
-        if self._transport == "MPEG_PS":
-            # Nothing to show, and no reason to hold eight packet bodies for a session.
-            self._dump_bodies.clear()
-            return
-        if complete_only and len(self._dump_bodies) < _PACKET_DUMP_PACKETS:
-            return
-        self._dumped = True
-        for index, body in enumerate(self._dump_bodies):
+        for index, body in enumerate(packets):
             _LOGGER.info(
                 "[FFmpeg] %spacket[%d] len=%d rtp=%s head=%s",
                 self._label(),
@@ -556,33 +685,38 @@ class CloudSession:
                 payload[:_PACKET_DUMP_PAYLOAD].hex(" "),
             )
 
-    def _pump_vtm_to_ffmpeg(self, stream: Any, ffmpeg: subprocess.Popen[bytes]) -> None:
-        """VTM packets -> FFmpeg stdin, until the stream ends or the session aborts."""
+    def _pump_vtm_to_ffmpeg(
+        self, packets: Iterator[Any], ffmpeg: subprocess.Popen[bytes], plan: _PayloadPlan
+    ) -> None:
+        """VTM packets -> FFmpeg stdin, until the stream ends or the session aborts.
+
+        The leading packets were read before FFmpeg was started, because they are what chose
+        its demuxer, so they go in first and the iterator then continues from the packet that
+        read stopped at. An RTP payload goes through the depacketizer one packet at a time:
+        what FFmpeg is reading is an elementary stream, and RTP is not one.
+        """
         stdin = ffmpeg.stdin
         if stdin is None:  # pragma: no cover - Popen(stdin=PIPE) always provides one
             raise PyEzvizError("FFmpeg was started without a stdin pipe")
+        depacketizer = (
+            RtpDepacketizer(plan.codec, payload_type=plan.payload_type)
+            if plan.codec is not None
+            else None
+        )
         try:
+            for body in plan.packets:
+                _forward(stdin, depacketizer, body)
+
             # include_control=True is what makes an idle session interruptible: while
             # the camera sleeps the only traffic is control packets, which the library
             # otherwise handles and swallows -- and then this loop would never come back
             # to check the cancel flag.
-            for packet in stream.iter_packets(include_control=True):
+            for packet in packets:
                 if self._cancel.is_set():
                     break
-                if packet.channel not in _STREAM_CHANNELS:
-                    continue
-                if packet.encrypted:
-                    raise PyEzvizError(
-                        "Received an encrypted VTM stream packet; "
-                        "media decryption is not implemented"
-                    )
-                if self.metrics.first_video_at is None:
-                    self._record("first-video")
-                self._sniff_payload(packet.body)
-                self.metrics.video_packets += 1
-                if packet.body:
-                    stdin.write(packet.body)
-                    stdin.flush()
+                body = self._accept(packet)
+                if body is not None:
+                    _forward(stdin, depacketizer, body)
         except (BrokenPipeError, ConnectionResetError):
             # FFmpeg is gone; the reader side reports why the session ended.
             return
@@ -592,9 +726,21 @@ class CloudSession:
             if not self._cancel.is_set():
                 self._writer_error = err
         finally:
-            # Report the prefix even if the stream ended before the sniff threshold, so a
-            # short or stalled session still says what its payload looked like.
-            self._flush_sniff()
+            if depacketizer is not None:
+                # A fragment whose end never arrived is media that did not make it out, and it
+                # belongs in the counts below rather than in silence.
+                depacketizer.flush()
+            if depacketizer is not None and (depacketizer.dropped or depacketizer.skipped):
+                # The difference between "the camera sent nothing" and "the camera sent
+                # something this bridge misread" is the whole reason these counts exist.
+                _LOGGER.warning(
+                    "[FFmpeg] %sthe %s depacketizer dropped %d unreadable packet(s) and "
+                    "skipped %d carrying another RTP payload type",
+                    self._label(),
+                    depacketizer.codec,
+                    depacketizer.dropped,
+                    depacketizer.skipped,
+                )
             # EOF for FFmpeg, which is what ends a session that stopped on its own.
             with suppress(OSError):
                 stdin.close()

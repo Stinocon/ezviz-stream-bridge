@@ -511,6 +511,13 @@ easier than expected: `isEncrypt: 0` on this device, so no media key and no decr
 needed; and `SupportEncrypt: 1`, meaning encryption exists but is off — turn it on in the app
 and a key fetch (with its own MFA prompt) comes back into play.
 
+The packaging is not fixed, and that is worth knowing before reading a stream log. This
+device's payload arrives as MPEG-PS, which FFmpeg demuxes directly; a `CS-C8c` on the same
+relay sends RTP carrying RFC 6184 H.264 instead, with the media behind a 12-byte RTP header
+and a fragmented IDR split across FU-A packets. Same cloud, same relay, different container —
+so the bridge classifies the leading packets and picks its demuxer from that, rather than
+assuming the one this device happens to use.
+
 The honest description of the result: **the video bytes come from the cloud, not the LAN.**
 What you gain is the camera in Home Assistant and Frigate without the EZVIZ app. What you do
 not gain is independence from the internet.

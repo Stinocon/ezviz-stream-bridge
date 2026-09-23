@@ -59,6 +59,14 @@ def control(body: bytes = b"keepalive") -> FakePacket:
 # point when the whole header is only twelve.
 RTP_SENTINEL = b"\x55\x66\x77\x88"
 
+# Annex-B start code, which is what an RTP payload has to be turned into before FFmpeg can
+# read it as an elementary stream.
+START_CODE = b"\x00\x00\x00\x01"
+
+# One MPEG-PS pack start code with a body: enough for the transport verdict, for the tests
+# whose subject is not the RTP path.
+PS_PACKET = b"\x00\x00\x01\xba" + b"data"
+
 
 def rtp_packet(  # noqa: PLR0913 - one per header field the tests vary, all keyword-only
     payload: bytes,
@@ -150,7 +158,8 @@ class ChattyVtmStream(FakeVtmStream):
     chance to see the cancel flag.
     """
 
-    def __init__(self, sock: socket.socket) -> None:
+    def __init__(self, sock: socket.socket, packets: list[FakePacket] | None = None) -> None:
+        # The scripted packets are deliberately ignored: this fake exists to never send video.
         super().__init__(sock, [], silent_after=False)
         self.stopped = threading.Event()
 
@@ -166,19 +175,22 @@ class ChattyVtmStream(FakeVtmStream):
 
 
 class WedgedVtmStream(FakeVtmStream):
-    """A VTM reader that no socket shutdown can wake.
+    """A VTM reader that no socket shutdown can wake, once its packets are handed over.
 
-    Stands in for anything that leaves the reader stuck where the session cannot reach
-    it -- and, in production, for an FFmpeg that will not act on SIGTERM while it is
-    probing an input that never delivers. The session still has to end.
+    Stands in for anything that leaves the reader stuck where the session cannot reach it --
+    and, in production, for an FFmpeg that will not act on SIGTERM while it is probing an
+    input that never delivers. The scripted packets are yielded first, because they are what
+    the session reads before starting FFmpeg; the wedge is what follows. The session still
+    has to end.
     """
 
-    def __init__(self, sock: socket.socket) -> None:
-        super().__init__(sock, [], silent_after=False)
+    def __init__(self, sock: socket.socket, packets: list[FakePacket] | None = None) -> None:
+        super().__init__(sock, list(packets or []), silent_after=False)
         self.release = threading.Event()
 
     def iter_packets(self, *, include_control: bool = False, **_: Any):
         self.iterating.set()
+        yield from self._packets
         self.release.wait(30)
         return
         yield  # pragma: no cover - makes this a generator
@@ -266,7 +278,7 @@ def vtm(monkeypatch: pytest.MonkeyPatch):
         def fake_open_cloud_stream(client, serial, *, timeout, socket_factory):
             sock = socket_factory(("vtm.invalid", 8666), timeout)
             if stream_class is not None:
-                stream: FakeVtmStream = stream_class(sock)
+                stream: FakeVtmStream = stream_class(sock, packets)
             else:
                 stream = FakeVtmStream(sock, packets, silent_after=silent_after)
             made["stream"] = stream
@@ -449,7 +461,7 @@ def test_session_ends_even_if_the_reader_cannot_be_woken(
     consumer pump has to end the session on the cancel flag alone.
     """
     monkeypatch.setattr(session_module, "_WRITER_JOIN_TIMEOUT", 0.5)
-    made = vtm([], stream_class=WedgedVtmStream)
+    made = vtm([video(PS_PACKET) for _ in range(8)], stream_class=WedgedVtmStream)
     session = CloudSession(object(), "BB1234567", ffmpeg_path=fake_ffmpeg, first_video_timeout=0)
     sink = Sink()
     thread, errors = run_in_thread(session, sink)
@@ -476,7 +488,7 @@ def test_session_ends_even_if_ffmpeg_ignores_the_terminate(
     EOF that would never come.
     """
     monkeypatch.setattr(session_module, "_WRITER_JOIN_TIMEOUT", 0.5)
-    made = vtm([], stream_class=WedgedVtmStream)
+    made = vtm([video(PS_PACKET) for _ in range(8)], stream_class=WedgedVtmStream)
     session = CloudSession(
         object(), "BB1234567", ffmpeg_path=stubborn_ffmpeg.path, first_video_timeout=0
     )
@@ -607,6 +619,51 @@ def test_ffmpeg_stderr_is_captured_and_bounded(vtm, tmp_path, caplog) -> None:
     assert all("conn=7" in line for line in lines)
 
 
+def test_an_rtp_stream_reaches_ffmpeg_as_annex_b(vtm, tmp_path: Path) -> None:
+    """The failure this whole path exists for. The CS-C8c sends RFC 6184 H.264 -- SPS, PPS and
+    a fragmented IDR -- and FFmpeg's `mpeg` demuxer produces nothing at all from it. What has
+    to reach FFmpeg is the elementary stream, with the codec named as the input format."""
+    ffmpeg_path, args_file = _arg_recording_ffmpeg(tmp_path, stderr_lines=0)
+    sps = b"\x67\x4d\x00\x32\x8d\x8d\x40\x14"
+    pps = b"\x68\xee\x38\x80"
+    vtm(
+        [
+            video(rtp_packet(sps)),
+            video(rtp_packet(pps)),
+            video(rtp_packet(b"\x7c\x85" + b"\x11" * 4)),
+            video(rtp_packet(b"\x7c\x45" + b"\x22" * 2)),
+        ],
+        silent_after=False,
+    )
+    session = CloudSession(object(), "BB1234567", ffmpeg_path=ffmpeg_path, first_video_timeout=0)
+    sink = Sink()
+    thread, errors = run_in_thread(session, sink)
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert bytes(sink.data) == (
+        START_CODE + sps + START_CODE + pps + START_CODE + b"\x65" + b"\x11" * 4 + b"\x22" * 2
+    )
+    args = args_file.read_text(encoding="utf-8").splitlines()
+    assert args[args.index("-f") + 1] == "h264"
+
+
+def test_an_mpeg_ps_stream_is_forwarded_untouched(vtm, fake_ffmpeg) -> None:
+    """The path that already works does not change: an MPEG-PS payload is not depacketized
+    and not reinterpreted, only moved through the prefix that decides its demuxer."""
+    first = b"\x00\x00\x01\xba" + b"\x20" * 4
+    second = b"\x00\x00\x01\xbb" + b"\x30" * 2
+    vtm([video(first), video(second)], silent_after=False)
+    session = CloudSession(object(), "BB1234567", ffmpeg_path=fake_ffmpeg, first_video_timeout=0)
+    sink = Sink()
+    thread, errors = run_in_thread(session, sink)
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert errors == []
+    assert bytes(sink.data) == first + second
+
+
 def test_classify_payload_recognises_mpeg_ps_at_any_offset() -> None:
     # The prefix starts mid-pack; the pack start code is what makes it PS, and it sits 100
     # bytes in. A per-packet check of the first byte could never see it.
@@ -695,10 +752,11 @@ def test_transport_sniff_buffers_across_packet_boundaries(vtm, fake_ffmpeg, capl
     assert "transport=MPEG_PS at offset=200" in lines[0]
 
 
-def test_transport_sniff_reports_on_the_threshold_while_the_stream_runs(
+def test_the_transport_is_reported_while_the_stream_is_still_running(
     vtm, fake_ffmpeg, caplog
 ) -> None:
-    """The threshold path, not only the end-of-stream flush: it must log once, while live."""
+    """Logged when the leading set is in hand, not at the end of the session: a session that
+    is still streaming has to be able to say what it settled on, and it must say it once."""
     caplog.set_level(logging.INFO)
     made = vtm(
         [video(b"\x00\x00\x01\xba" + b"\x22" * 40) for _ in range(12)], silent_after=True
@@ -743,7 +801,7 @@ def test_stderr_pipe_matches_the_diagnostic_flag(fake_ffmpeg, capturing: bool) -
     session = CloudSession(
         object(), "BB1234567", ffmpeg_path=fake_ffmpeg, ffmpeg_stderr=capturing
     )
-    process = session._start_ffmpeg()
+    process = session._start_ffmpeg("mpeg")
     try:
         assert (process.stderr is None) is not capturing
     finally:
@@ -753,6 +811,31 @@ def test_stderr_pipe_matches_the_diagnostic_flag(fake_ffmpeg, capturing: bool) -
             process.stderr.close()
 
 
+@pytest.mark.parametrize(
+    ("demuxer", "wallclock"), [("h264", True), ("hevc", True), ("mpeg", False)]
+)
+def test_ffmpeg_is_told_what_it_is_reading(
+    tmp_path: Path, demuxer: str, wallclock: bool
+) -> None:
+    """FFmpeg cannot read RTP out of a pipe, so for an RTP payload the session hands it the
+    depacketized elementary stream and names the codec as the input format. Such a stream has
+    no container to carry a timestamp, which is what `-use_wallclock_as_timestamps` supplies --
+    and without which HEVC remuxed to MPEG-TS fails outright."""
+    ffmpeg_path, args_file = _arg_recording_ffmpeg(tmp_path, stderr_lines=0)
+    session = CloudSession(object(), "BB1234567", ffmpeg_path=ffmpeg_path)
+
+    process = session._start_ffmpeg(demuxer)  # noqa: SLF001 - the argv is the subject
+    try:
+        process.stdin.close()
+        process.wait(timeout=TEARDOWN_LIMIT)
+    finally:
+        process.stdout.close()
+
+    args = args_file.read_text(encoding="utf-8").splitlines()
+    assert args[args.index("-f") + 1] == demuxer
+    assert ("-use_wallclock_as_timestamps" in args) is wallclock
+
+
 def test_stderr_capture_tears_down_with_a_live_ffmpeg(
     vtm, stubborn_ffmpeg, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -760,7 +843,7 @@ def test_stderr_capture_tears_down_with_a_live_ffmpeg(
     live FFmpeg's stderr while the session aborts, and FFmpeg ignores the terminate."""
     monkeypatch.setattr(session_module, "_WRITER_JOIN_TIMEOUT", 0.5)
     monkeypatch.setattr(session_module, "_FFMPEG_REAP_TIMEOUT", 0.2)
-    made = vtm([], stream_class=WedgedVtmStream)
+    made = vtm([video(PS_PACKET) for _ in range(8)], stream_class=WedgedVtmStream)
     session = CloudSession(
         object(),
         "BB1234567",
@@ -854,13 +937,16 @@ def test_packet_dump_explains_a_packet_whose_extension_overruns_it(
 
     No unwrap can succeed on a packet the log only shows the start of, so the dump must say
     which of the two it is -- an overrun, or a payload -- instead of printing an offset that
-    was never reached.
+    was never reached. The session then says in a warning that no codec could be named and
+    leaves the payload on the demuxer it has always used: a transport read wrong is not a
+    reason to refuse a session that would have worked.
     """
     caplog.set_level(logging.INFO)
     head = bytes.fromhex(
         "90 f0 b3 a3 fb 3d 75 b8 55 66 77 88 00 01 00 0c 40 0e 48 4b 00 02 1a 9b"
     )
     _run_one_video_packet(vtm, fake_ffmpeg, head, stderr=True)
+    messages = [record.getMessage() for record in caplog.records]
     lines = _diagnostic_lines(caplog)
 
     assert any("payload transport=RTP at offset=0" in line for line in lines)
@@ -868,14 +954,60 @@ def test_packet_dump_explains_a_packet_whose_extension_overruns_it(
         "packet[0] rtp payload: RTP extension payload exceeds packet length" in line
         for line in lines
     )
+    assert any("carries an H.264 or HEVC parameter set" in message for message in messages)
+    assert any("leaving it to FFmpeg's `mpeg` demuxer" in message for message in messages)
 
 
-def test_packet_dump_waits_for_the_leading_set_after_an_early_verdict(
+def test_a_metadata_packet_does_not_count_as_the_first_video(vtm, fake_ffmpeg) -> None:
+    """A packet on the video channel is not the same thing as video on it. The CS-C8c opens a
+    session with two 64- and 44-byte payload-type-112 packets whose header extension consumes
+    the whole packet, and taking those for a picture would disarm the no-video budget for a
+    camera that then sent nothing else -- the one case that budget exists for."""
+    # An empty body, and a packet whose whole body is its header extension: neither is media.
+    vtm(
+        [video(b""), video(rtp_packet(b"", extension=bytes(48)))],
+        silent_after=False,
+    )
+    session = CloudSession(object(), "BB1234567", ffmpeg_path=fake_ffmpeg, first_video_timeout=0)
+    sink = Sink()
+    thread, errors = run_in_thread(session, sink)
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert errors == []
+    assert session.metrics.video_packets == 2, "the packets were still counted on the channel"
+    assert session.metrics.first_video_at is None, "no media ever arrived"
+
+
+def test_packets_the_depacketizer_could_not_read_are_reported(
     vtm, fake_ffmpeg, caplog
 ) -> None:
-    """The full shape of the bug this guards: the byte bound fires on the third packet, the
-    verdict goes out then -- it must -- and the dump still waits for the leading eight rather
-    than answering with the three that happened to trip it."""
+    """Silence is not an explanation. When packets arrive that the depacketizer cannot make
+    sense of, the count is the only thing that tells "the camera sent nothing" apart from "the
+    bridge misread what it sent" -- the distinction every failure in this project has turned
+    on."""
+    caplog.set_level(logging.INFO)
+    vtm(
+        [
+            video(rtp_packet(b"\x67\x4d\x00\x32")),
+            video(rtp_packet(b"\x7c\x05" + b"\xaa" * 4)),  # a continuation with no start
+            video(rtp_packet(b"\x7c\x85" + b"\xbb" * 4)),  # a fragment that never ends
+        ],
+        silent_after=False,
+    )
+    session = CloudSession(object(), "BB1234567", ffmpeg_path=fake_ffmpeg, first_video_timeout=0)
+    thread, errors = run_in_thread(session, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert errors == []
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "dropped 2 unreadable packet(s) and skipped 0" in message for message in messages
+    )
+
+
+def test_packet_dump_covers_the_leading_set(vtm, fake_ffmpeg, caplog) -> None:
+    """The dump is the evidence the decision rests on: the whole leading set the session read
+    before starting FFmpeg, in order, and after the verdict rather than before it."""
     caplog.set_level(logging.INFO)
     packets = [video(rtp_packet(b"\x40\x01" + bytes([index]) * 3000)) for index in range(12)]
     vtm(packets, silent_after=False)
@@ -906,14 +1038,11 @@ def test_packet_dump_is_silent_for_an_mpeg_ps_stream(vtm, fake_ffmpeg, caplog) -
     """A PS stream needs none of it: FFmpeg identifies its codec, and eight packets of noise
     per session is what an opt-in diagnostic must not turn into by default."""
     caplog.set_level(logging.INFO)
-    session = _run_one_video_packet(
-        vtm, fake_ffmpeg, b"\x00\x00\x01\xba" + b"\x22" * 100, stderr=True
-    )
+    _run_one_video_packet(vtm, fake_ffmpeg, b"\x00\x00\x01\xba" + b"\x22" * 100, stderr=True)
     lines = _diagnostic_lines(caplog)
 
     assert any("payload transport=MPEG_PS at offset=0" in line for line in lines)
     assert not [line for line in lines if "packet[" in line]
-    assert session._dump_bodies == [], "a PS session has no reason to hold packet bodies"  # noqa: SLF001
 
 
 def test_packet_dump_stops_after_the_leading_packets(vtm, fake_ffmpeg, caplog) -> None:
@@ -972,12 +1101,9 @@ def test_packet_dump_skips_the_csrc_list(vtm, fake_ffmpeg, caplog) -> None:
     assert unwrapped.endswith(payload[:64].hex(" "))
 
 
-def test_packet_dump_is_not_cut_short_by_an_early_transport_verdict(
-    vtm, fake_ffmpeg, caplog
-) -> None:
-    """Eight kilobytes can arrive in three packets, and the verdict must come then -- but the
-    packet dump answers a question that wants the leading packets, not the three that happened
-    to trip the byte bound. Here the stream ends before a full set, so all of them are shown."""
+def test_packet_dump_covers_a_stream_that_ended_early(vtm, fake_ffmpeg, caplog) -> None:
+    """A stream that ends before the leading set is full is still explained by what it sent:
+    the dump is bounded by the prefix that was read, not padded out with what never came."""
     caplog.set_level(logging.INFO)
     packets = [video(rtp_packet(b"\x40\x01" + bytes([index]) * 4000)) for index in range(5)]
     vtm(packets, silent_after=False)
@@ -1033,7 +1159,7 @@ def test_packet_dump_flushes_when_the_session_is_aborted_mid_sniff(
     thread, errors = run_in_thread(session, Sink())
     assert made["stream"].iterating.wait(SETTLE)
     deadline = time.monotonic() + SETTLE
-    while time.monotonic() < deadline and len(session._dump_bodies) < 2:  # noqa: SLF001 - the only way to see the reader's progress
+    while time.monotonic() < deadline and session.metrics.video_packets < 2:
         time.sleep(0.01)
 
     try:
@@ -1050,6 +1176,29 @@ def test_packet_dump_flushes_when_the_session_is_aborted_mid_sniff(
     assert any("payload transport=RTP" in line for line in lines)
     numbered = [line for line in lines if " packet[" in line and " len=" in line]
     assert [line.split("packet[")[1].split("]")[0] for line in numbered] == ["0", "1"]
+
+
+def test_an_abort_during_the_prefix_is_not_blamed_on_the_payload(vtm, fake_ffmpeg) -> None:
+    """A consumer that leaves while the leading packets are being read is a disconnect, not a
+    stream this bridge cannot read. The codec check would otherwise report "no parameter set"
+    for a stream that was simply cut off -- the wrong reason, in the log line an operator uses
+    to tell the two apart."""
+    made = vtm(
+        [video(rtp_packet(b"\x7c\x05" + b"\xaa" * 30)) for _ in range(2)], silent_after=True
+    )
+    session = CloudSession(object(), "BB1234567", ffmpeg_path=fake_ffmpeg, first_video_timeout=0)
+    thread, errors = run_in_thread(session, Sink())
+    assert made["stream"].iterating.wait(SETTLE)
+    deadline = time.monotonic() + SETTLE
+    while time.monotonic() < deadline and session.metrics.video_packets < 2:
+        time.sleep(0.01)
+
+    session.abort("client gone")
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert session.abort_reason == "client gone"
 
 
 def test_packet_dump_needs_the_diagnostic_flag(vtm, fake_ffmpeg, caplog) -> None:

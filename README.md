@@ -69,7 +69,7 @@ stream on the camera's own motion sensor — is in the
 
 ```
 EZVIZ camera ─► EZVIZ cloud (VTM relay) ─► in-process proxy ─► MPEG-TS over HTTP ─► go2rtc ─► Frigate
-                                              ▲   (pyezvizapi VTM + remux)
+                                              ▲   (pyezvizapi VTM; this repo's demux)
                                     this repo: session, supervision, per-connection logging
 ```
 
@@ -77,7 +77,7 @@ Consumers reach the stream at the Home Assistant host IP on the mapped port
 (`http://<ha-ip>:8558/<serial>.ts`), not at an add-on hostname — see the
 [add-on README](https://github.com/Stinocon/addons/tree/master/ezviz-stream-bridge).
 
-The VTM session and the remux are all [pyezvizapi](https://github.com/RenierM26/pyEzvizApi).
+The VTM session comes from [pyezvizapi](https://github.com/RenierM26/pyEzvizApi).
 This project is the part that has to keep working for weeks unattended:
 
 - **One supervised proxy per camera**, restarted with a growing, capped delay. A camera that
@@ -100,19 +100,34 @@ This project is the part that has to keep working for weeks unattended:
   its response closes — FFmpeg through go2rtc does exactly this — is made to wait instead of
   waking a camera that has only just fallen asleep. The cooldown is a pause between inbound
   requests, never a request the bridge originates, and it ends early if the consumer leaves.
+- **The payload is not always MPEG-PS, so the demuxer is decided, not assumed.** The VTM
+  relay hands over whatever the camera produces, and this family produces both: MPEG-PS,
+  which FFmpeg demuxes directly, and RTP carrying RFC 6184 H.264 or RFC 7798 HEVC. No
+  single FFmpeg input format reads both, and `rtp` is not one of them — it wants a UDP URL
+  and an SDP, and the packets are already here. So every session reads the leading video
+  packets first, classifies the transport from that prefix, and a payload that is RTP is
+  depacketized into an Annex-B elementary stream (single NAL units, STAP-A and AP
+  aggregates, FU-A and FU fragments) before FFmpeg is started with `-f h264` or `-f hevc`
+  and `-use_wallclock_as_timestamps`, without which the MPEG-TS muxer refuses a stream
+  that has no container to carry a timestamp. An MPEG-PS stream is untouched: same
+  demuxer, byte for byte. The price is up to eight packets of added latency on every
+  session, because the decision has to happen before FFmpeg exists.
+- **A stream that produces nothing now says which of the two it is.** A payload that is
+  RTP with no H.264 or HEVC parameter set to name it, and packets the depacketizer cannot
+  read, are counted and logged rather than left as a bare `bytes=0`.
 - **A remux that produces nothing can be explained, not guessed at.** FFmpeg's stderr is
   discarded by default; with `log_ffmpeg_stderr` (or `--log-ffmpeg-stderr` on the proxy) it is run
   at `info` and its output logged, bounded to 20 lines and then a single suppression notice. It
   also reports the detected payload transport (MPEG-PS, MPEG-TS, RTP or unknown) and where its
-  signature sits in the leading payload — buffered across VTM packets, so a packet boundary
-  cannot hide an MPEG-PS or MPEG-TS signature. When the transport is anything but MPEG-PS it goes
-  further and prints the first eight packets of the session — or all of them, if the session ends
-  first: the length, the RTP header fields decoded, the leading bytes, and the payload sliced out
-  at the offset `pyezvizapi`'s own unwrap computes. That last line is the one that answers the
-  useful question — where the video starts and what codec it is — which a 24-byte head cannot,
-  since an RTP header alone is 12 bytes plus up to 60 bytes of CSRC list plus a variable-length
-  extension. This is the first thing to turn on when a camera sends video but no MPEG-TS comes
-  out.
+  signature sits in the leading payload — the same reading the demuxer is chosen from, so a
+  diagnostic that disagrees with the demuxer is itself the bug. When the transport is anything
+  but MPEG-PS it goes further and prints the first eight packets of the session — or all of them,
+  if the session ends first: the length, the RTP header fields decoded, the leading bytes, and the
+  payload sliced out at the offset `pyezvizapi`'s own unwrap computes. That last line is the one
+  that answers the useful question — where the video starts and what codec it is — which a
+  24-byte head cannot, since an RTP header alone is 12 bytes plus up to 60 bytes of CSRC list
+  plus a variable-length extension. This is the first thing to turn on when a camera sends video
+  but no MPEG-TS comes out.
 - **Timestamps you can line up with other logs.** Every line carries an ISO-8601 local time to
   the millisecond, and each session reports `session opened`, `first-video` (the camera starting
   to send) and `first-byte` (the consumer starting to receive), so a wake-up can be measured
@@ -182,10 +197,21 @@ pytest
 ruff check .
 ```
 
+The RTP path is verified against the FFmpeg the add-on actually runs, not the one on a
+development machine — the image installs Debian's, and a remux that worked on a laptop has
+failed inside the container before. The script builds a synthetic H.264 and HEVC stream,
+packetizes it the way RFC 6184 and RFC 7798 say a camera does, and pushes it through the
+real depacketizer and the real FFmpeg invocation:
+
+```bash
+tools/verify_rtp_against_addon.sh
+```
+
 ## Credits
 
 [pyezvizapi](https://github.com/RenierM26/pyEzvizApi) by RenierM26 does the entire EZVIZ
-protocol implementation — cloud API, stream framing, remux. It is also what the official Home
+protocol implementation — cloud API, stream framing, and the MPEG-PS remux helper this project
+replaced with its own interruptible one. It is also what the official Home
 Assistant EZVIZ integration uses, so for entities (doorbell, motion, battery, switches) install
 that integration rather than expecting them here: this project deliberately only does the
 stream.
