@@ -1,0 +1,7 @@
+{
+  "gates": [
+    { "name": "tests", "command": ".venv/bin/python -m pytest -q" },
+    { "name": "lint", "command": ".venv/bin/ruff check ." }
+  ],
+  "timeoutMs": 300000
+}
