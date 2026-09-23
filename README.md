@@ -57,9 +57,10 @@ Frigate's MQTT switches that stops the stream being consumed: `detect`, `recordi
 a separate process that knows nothing about that flag, so any live view — the Frigate UI, a
 dashboard card — opens a consumer of its own regardless.
 
-Measured through this bridge: **~4.3 s to first byte, first keyframe 1.4 s in**, so about six
-seconds from request to a decodable frame, with keyframes every 4 s. Recording starts mid-scene
-by construction.
+Measured through this bridge on a CP4, over ten sessions on 2026-09-23: the wake-up — the
+camera starting to send — costs **0.8–4.8 s**, typically about one. FFmpeg then takes a fixed
+**≈5.2 s** to identify the stream, so the consumer sees its first byte **6–10 s after the
+request**. Keyframes arrive every 4 s, so a recording starts mid-scene by construction.
 
 The full account — the Frigate configuration, and a worked Home Assistant example that gates the
 stream on the camera's own motion sensor — is in the
