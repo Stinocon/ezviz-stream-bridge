@@ -54,6 +54,52 @@ def control(body: bytes = b"keepalive") -> FakePacket:
     return FakePacket(channel=VtmChannel.MESSAGE, body=body)
 
 
+# The value that sits in an EZVIZ camera's SSRC field, and the one pyezvizapi's local frame
+# parser uses as its IDMX sentinel -- four bytes, in the same place either way, which is the
+# point when the whole header is only twelve.
+RTP_SENTINEL = b"\x55\x66\x77\x88"
+
+
+def rtp_packet(  # noqa: PLR0913 - one per header field the tests vary, all keyword-only
+    payload: bytes,
+    *,
+    sequence: int = 0xB3A3,
+    timestamp: int = 0xFB3D75B8,
+    payload_type: int = 112,
+    csrc_count: int = 0,
+    extension: bytes | None = None,
+    padding: int = 0,
+) -> bytes:
+    """A video packet as an RTP-transport camera sends it: header fields, then the media.
+
+    With `extension` set the X bit is set and the four extension bytes carry the profile and
+    the length in 32-bit words, which pushes the media 4 + 4*words bytes further in -- the
+    case no 24-byte head can show, and the reason the packet dump exists. `csrc_count` moves
+    it forward four bytes per source, and `padding` appends its own count, which a demux has
+    to read from the last byte of the packet rather than from its header.
+    """
+    first = 0x80
+    if extension is not None:
+        first |= 0x10
+    if padding:
+        first |= 0x20
+    fixed = (
+        bytes([first | csrc_count, 0x80 | payload_type])
+        + sequence.to_bytes(2, "big")
+        + timestamp.to_bytes(4, "big")
+        + RTP_SENTINEL
+    )
+    body = fixed + b"".join(
+        (0x0A000000 + index).to_bytes(4, "big") for index in range(csrc_count)
+    )
+    if extension is not None:
+        body += b"\x00\x01" + (len(extension) // 4).to_bytes(2, "big") + extension
+    body += payload
+    if padding:
+        body += b"\x00" * (padding - 1) + bytes([padding])
+    return body
+
+
 class FakeVtmStream:
     """A VTM client whose silence is a real blocking read on a real socket.
 
@@ -752,3 +798,264 @@ def test_ffmpeg_stderr_is_discarded_by_default(vtm, tmp_path, caplog) -> None:
     assert errors == []
     assert _loglevel_arg(args_file) == "error"
     assert not [r for r in caplog.records if "[FFmpeg]" in r.getMessage()]
+
+
+def _diagnostic_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [record.getMessage() for record in caplog.records if "[FFmpeg]" in record.getMessage()]
+
+
+def _run_one_video_packet(vtm, fake_ffmpeg, body: bytes, *, stderr: bool):
+    """Run a session over a single video packet and return its log lines."""
+    vtm([video(body)], silent_after=False)
+    session = CloudSession(
+        object(),
+        "BB1234567",
+        ffmpeg_path=fake_ffmpeg,
+        first_video_timeout=0,
+        ffmpeg_stderr=stderr,
+    )
+    thread, errors = run_in_thread(session, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+    assert not thread.is_alive()
+    assert errors == []
+    return session
+
+
+def test_packet_dump_slices_the_payload_past_an_rtp_extension(vtm, fake_ffmpeg, caplog) -> None:
+    """The question the 24-byte head cannot answer: X is set, so where does the media start?
+
+    Twelve fixed bytes plus a four-byte extension header plus twelve words puts the payload
+    at byte 64 -- twice as far in as the transport line prints. The dump decodes the header
+    and slices the payload out at the offset pyezvizapi's own unwrap computes, so the line
+    is what a demux would actually be handed.
+    """
+    caplog.set_level(logging.INFO)
+    payload = b"\x40\x01\x0c\x01\xff\xff\x04\x08" + b"\xaa" * 56
+    _run_one_video_packet(
+        vtm,
+        fake_ffmpeg,
+        rtp_packet(payload, extension=bytes(range(48))) + b"\xbb" * 60,
+        stderr=True,
+    )
+    lines = _diagnostic_lines(caplog)
+
+    assert any("payload transport=RTP at offset=0" in line for line in lines)
+    header = next(line for line in lines if "packet[0] len=" in line)
+    assert "rtp=V2 P0 X1 CC0 M1 PT112 seq=0xb3a3 ts=0xfb3d75b8" in header
+    assert "head=90 f0 b3 a3 fb 3d 75 b8 55 66 77 88 00 01 00 0c" in header
+    unwrapped = next(line for line in lines if "rtp payload+64=" in line)
+    assert unwrapped.endswith(payload[:64].hex(" "))
+
+
+def test_packet_dump_explains_a_packet_whose_extension_overruns_it(
+    vtm, fake_ffmpeg, caplog
+) -> None:
+    """The reporter's own 24-byte head: the extension declares 48 bytes, the head has none.
+
+    No unwrap can succeed on a packet the log only shows the start of, so the dump must say
+    which of the two it is -- an overrun, or a payload -- instead of printing an offset that
+    was never reached.
+    """
+    caplog.set_level(logging.INFO)
+    head = bytes.fromhex(
+        "90 f0 b3 a3 fb 3d 75 b8 55 66 77 88 00 01 00 0c 40 0e 48 4b 00 02 1a 9b"
+    )
+    _run_one_video_packet(vtm, fake_ffmpeg, head, stderr=True)
+    lines = _diagnostic_lines(caplog)
+
+    assert any("payload transport=RTP at offset=0" in line for line in lines)
+    assert any(
+        "packet[0] rtp payload: RTP extension payload exceeds packet length" in line
+        for line in lines
+    )
+
+
+def test_packet_dump_waits_for_the_leading_set_after_an_early_verdict(
+    vtm, fake_ffmpeg, caplog
+) -> None:
+    """The full shape of the bug this guards: the byte bound fires on the third packet, the
+    verdict goes out then -- it must -- and the dump still waits for the leading eight rather
+    than answering with the three that happened to trip it."""
+    caplog.set_level(logging.INFO)
+    packets = [video(rtp_packet(b"\x40\x01" + bytes([index]) * 3000)) for index in range(12)]
+    vtm(packets, silent_after=False)
+    session = CloudSession(
+        object(),
+        "BB1234567",
+        ffmpeg_path=fake_ffmpeg,
+        first_video_timeout=0,
+        ffmpeg_stderr=True,
+    )
+    thread, errors = run_in_thread(session, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert not thread.is_alive()
+    assert errors == []
+    lines = _diagnostic_lines(caplog)
+    verdict = next(index for index, line in enumerate(lines) if "payload transport=" in line)
+    numbered = [
+        (index, line) for index, line in enumerate(lines) if " packet[" in line and " len=" in line
+    ]
+    assert [line.split("packet[")[1].split("]")[0] for _, line in numbered] == [
+        str(index) for index in range(8)
+    ]
+    assert verdict < numbered[0][0], "the dump must come after the verdict, never before it"
+
+
+def test_packet_dump_is_silent_for_an_mpeg_ps_stream(vtm, fake_ffmpeg, caplog) -> None:
+    """A PS stream needs none of it: FFmpeg identifies its codec, and eight packets of noise
+    per session is what an opt-in diagnostic must not turn into by default."""
+    caplog.set_level(logging.INFO)
+    session = _run_one_video_packet(
+        vtm, fake_ffmpeg, b"\x00\x00\x01\xba" + b"\x22" * 100, stderr=True
+    )
+    lines = _diagnostic_lines(caplog)
+
+    assert any("payload transport=MPEG_PS at offset=0" in line for line in lines)
+    assert not [line for line in lines if "packet[" in line]
+    assert session._dump_bodies == [], "a PS session has no reason to hold packet bodies"  # noqa: SLF001
+
+
+def test_packet_dump_stops_after_the_leading_packets(vtm, fake_ffmpeg, caplog) -> None:
+    """Bounded, and in order: the leading packets only, once each."""
+    caplog.set_level(logging.INFO)
+    packets = [video(rtp_packet(b"\x40\x01" + bytes([index]) * 30)) for index in range(12)]
+    vtm(packets, silent_after=False)
+    session = CloudSession(
+        object(),
+        "BB1234567",
+        ffmpeg_path=fake_ffmpeg,
+        first_video_timeout=0,
+        ffmpeg_stderr=True,
+    )
+    thread, errors = run_in_thread(session, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert not thread.is_alive()
+    assert errors == []
+    numbered = [
+        line for line in _diagnostic_lines(caplog) if " packet[" in line and " len=" in line
+    ]
+    assert [line.split("packet[")[1].split("]")[0] for line in numbered] == [
+        str(index) for index in range(8)
+    ]
+
+
+def test_packet_dump_reads_padding_from_the_real_end_of_the_packet(
+    vtm, fake_ffmpeg, caplog
+) -> None:
+    """P is a count in the last byte of the packet, so the dump has to keep the whole packet:
+    a truncated copy strips a byte count taken from the middle of the media and reports an
+    offset that is simply wrong. No cap, however generous, would be safe here."""
+    caplog.set_level(logging.INFO)
+    payload = b"\x40\x01" + b"\xaa" * 6000
+    _run_one_video_packet(vtm, fake_ffmpeg, rtp_packet(payload, padding=8), stderr=True)
+    lines = _diagnostic_lines(caplog)
+
+    assert any(f"packet[0] len={6000 + 2 + 12 + 8} rtp=V2 P1" in line for line in lines)
+    unwrapped = next(line for line in lines if "packet[0] rtp payload+" in line)
+    assert "packet[0] rtp payload+20=" in unwrapped
+    assert unwrapped.endswith(payload[:64].hex(" "))
+
+
+def test_packet_dump_skips_the_csrc_list(vtm, fake_ffmpeg, caplog) -> None:
+    """CC moves the media forward four bytes per source: the header line must report it and
+    the payload line must land past it, not on the first source identifier."""
+    caplog.set_level(logging.INFO)
+    payload = b"\x67\xf4\x00\x0b" + b"\xcc" * 60
+    _run_one_video_packet(vtm, fake_ffmpeg, rtp_packet(payload, csrc_count=2), stderr=True)
+    lines = _diagnostic_lines(caplog)
+
+    assert any("rtp=V2 P0 X0 CC2 M1 PT112" in line for line in lines)
+    unwrapped = next(line for line in lines if "packet[0] rtp payload+" in line)
+    assert "packet[0] rtp payload+20=" in unwrapped
+    assert unwrapped.endswith(payload[:64].hex(" "))
+
+
+def test_packet_dump_is_not_cut_short_by_an_early_transport_verdict(
+    vtm, fake_ffmpeg, caplog
+) -> None:
+    """Eight kilobytes can arrive in three packets, and the verdict must come then -- but the
+    packet dump answers a question that wants the leading packets, not the three that happened
+    to trip the byte bound. Here the stream ends before a full set, so all of them are shown."""
+    caplog.set_level(logging.INFO)
+    packets = [video(rtp_packet(b"\x40\x01" + bytes([index]) * 4000)) for index in range(5)]
+    vtm(packets, silent_after=False)
+    session = CloudSession(
+        object(),
+        "BB1234567",
+        ffmpeg_path=fake_ffmpeg,
+        first_video_timeout=0,
+        ffmpeg_stderr=True,
+    )
+    thread, errors = run_in_thread(session, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert not thread.is_alive()
+    assert errors == []
+    lines = _diagnostic_lines(caplog)
+    assert any("payload transport=RTP" in line for line in lines)
+    numbered = [line for line in lines if " packet[" in line and " len=" in line]
+    assert [line.split("packet[")[1].split("]")[0] for line in numbered] == [
+        str(index) for index in range(5)
+    ]
+
+
+def test_packet_dump_covers_a_payload_that_is_not_rtp_either(vtm, fake_ffmpeg, caplog) -> None:
+    """UNKNOWN is a verdict too, and the dump is what says why: the header bytes are not an
+    RTP header, and the unwrap says so in words rather than printing an offset that is not
+    there."""
+    caplog.set_level(logging.INFO)
+    _run_one_video_packet(vtm, fake_ffmpeg, b"\x11" * 200, stderr=True)
+    lines = _diagnostic_lines(caplog)
+
+    assert any("payload transport=UNKNOWN at offset=-1" in line for line in lines)
+    assert any("packet[0] len=200 rtp=none" in line for line in lines)
+    assert any("packet[0] rtp payload: Unsupported RTP version" in line for line in lines)
+
+
+def test_packet_dump_flushes_when_the_session_is_aborted_mid_sniff(
+    vtm, fake_ffmpeg, caplog
+) -> None:
+    """Two packets and then silence: with less than a full set, the verdict and the dump both
+    come from the teardown. Evidence that exists at the moment of an abort has to survive it."""
+    caplog.set_level(logging.INFO)
+    made = vtm(
+        [video(rtp_packet(b"\x40\x01" + b"\xaa" * 30)) for _ in range(2)], silent_after=True
+    )
+    session = CloudSession(
+        object(),
+        "BB1234567",
+        ffmpeg_path=fake_ffmpeg,
+        first_video_timeout=0,
+        ffmpeg_stderr=True,
+    )
+    thread, errors = run_in_thread(session, Sink())
+    assert made["stream"].iterating.wait(SETTLE)
+    deadline = time.monotonic() + SETTLE
+    while time.monotonic() < deadline and len(session._dump_bodies) < 2:  # noqa: SLF001 - the only way to see the reader's progress
+        time.sleep(0.01)
+
+    try:
+        session.abort("client gone")
+        thread.join(timeout=TEARDOWN_LIMIT)
+        assert not thread.is_alive()
+        assert errors == []
+    finally:
+        # Nothing to release for this fake: the abort already shut its socket down, which is
+        # exactly how the reader escapes the blocking recv.
+        pass
+
+    lines = _diagnostic_lines(caplog)
+    assert any("payload transport=RTP" in line for line in lines)
+    numbered = [line for line in lines if " packet[" in line and " len=" in line]
+    assert [line.split("packet[")[1].split("]")[0] for line in numbered] == ["0", "1"]
+
+
+def test_packet_dump_needs_the_diagnostic_flag(vtm, fake_ffmpeg, caplog) -> None:
+    """Off by default, like the rest of the capture: an RTP payload must not change that."""
+    caplog.set_level(logging.INFO)
+    _run_one_video_packet(
+        vtm, fake_ffmpeg, rtp_packet(b"\x40\x01" + b"\xaa" * 30), stderr=False
+    )
+    assert not _diagnostic_lines(caplog)

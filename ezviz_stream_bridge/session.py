@@ -34,7 +34,7 @@ from typing import Any, BinaryIO
 
 from pyezvizapi.cloud_stream import open_cloud_stream
 from pyezvizapi.exceptions import PyEzvizError
-from pyezvizapi.stream import VtmChannel
+from pyezvizapi.stream import VtmChannel, rtp_payload
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -86,6 +86,22 @@ _FFMPEG_STDERR_JOIN_TIMEOUT = 2.0
 _PAYLOAD_SNIFF_BYTES = 8192
 _PAYLOAD_SNIFF_PACKETS = 8
 
+# The transport line above answers "what is this payload?" with the first 24 bytes. For a
+# payload the remux does not expect, that is not enough to answer the next question -- where
+# does the video actually start, and what codec is it? An RTP header is 12 bytes plus up to 60
+# bytes of CSRC list plus a variable-length extension, so the media can begin well past byte
+# 24 and a 24-byte head says nothing about it. These bound a per-packet dump that does answer
+# it: the first packets of the session, each with its header decoded and its payload sliced
+# out at the offset pyezvizapi's own unwrap computes.
+#
+# The whole body is kept, not a leading slice of it: `rtp_payload` reads the padding count
+# from the last byte of the packet, so a truncated copy would strip a byte count taken from
+# the middle of the media and report an offset that is simply wrong. The bodies are bounded
+# by the VTM framing itself -- a 16-bit length, so under 64 KiB each, eight of them at most.
+_PACKET_DUMP_PACKETS = 8
+_PACKET_DUMP_HEAD = 64
+_PACKET_DUMP_PAYLOAD = 64
+
 # MPEG-PS pack_start_code. The byte after `00 00 01` is 0xBA, whose top bit is set -- the
 # forbidden_zero_bit of an H.264/H.265 NAL header -- so it cannot be a valid NAL, and a
 # conformant elementary stream cannot contain this sequence (emulation prevention blocks
@@ -99,6 +115,8 @@ _TS_SYNC_RUN = 3
 # The two top bits of an RTP header byte carry the version, which is 2 here.
 _RTP_VERSION_MASK = 0xC0
 _RTP_VERSION_2 = 0x80
+# The fixed part of an RTP header, before any CSRC list or extension.
+_RTP_HEADER_BYTES = 12
 
 
 def _looks_like_mpeg_ts(data: bytes, start: int) -> bool:
@@ -135,6 +153,24 @@ def classify_payload(data: bytes) -> tuple[str, int]:
         return "RTP", 0
 
     return "UNKNOWN", -1
+
+
+def _describe_rtp_header(body: bytes) -> str:
+    """Decode the fixed RTP header fields, or say that the bytes are not one.
+
+    The twelve fixed bytes only, so the reading is the one the specification gives and not
+    an interpretation: X, CC and P decide where the payload starts and how much of its tail is
+    padding, which is the whole point of printing them -- with X set and a length of 12 words,
+    the media begins at byte 64 and no 24-byte head could have shown it.
+    """
+    if len(body) < _RTP_HEADER_BYTES or (body[0] & _RTP_VERSION_MASK) != _RTP_VERSION_2:
+        return "none"
+    return (
+        f"V{body[0] >> 6} P{(body[0] >> 5) & 1} X{(body[0] >> 4) & 1} CC{body[0] & 0x0F} "
+        f"M{body[1] >> 7} PT{body[1] & 0x7F} "
+        f"seq=0x{int.from_bytes(body[2:4], 'big'):04x} "
+        f"ts=0x{int.from_bytes(body[4:8], 'big'):08x}"
+    )
 
 
 @dataclass
@@ -180,6 +216,9 @@ class CloudSession:
         self._sniff_buffer = bytearray()
         self._sniff_packets = 0
         self._sniffed = False
+        self._dump_bodies: list[bytes] = []
+        self._dumped = False
+        self._transport: str | None = None
         self._abort_reason: str | None = None
         self._socket: socket.socket | None = None
         self._ffmpeg: subprocess.Popen[bytes] | None = None
@@ -412,7 +451,18 @@ class CloudSession:
         Deferred until enough of the prefix is in hand that a signature has to be present,
         which is what makes the answer independent of where the VTM packet boundaries fell.
         """
-        if not self._ffmpeg_stderr or self._sniffed or not body:
+        if not self._ffmpeg_stderr or not body:
+            return
+        if (
+            not self._dumped
+            and self._transport != "MPEG_PS"
+            and len(self._dump_bodies) < _PACKET_DUMP_PACKETS
+        ):
+            self._dump_bodies.append(body)
+        if self._sniffed:
+            # The verdict is already out; the dump is complete the moment the last of the
+            # leading packets is in hand, and until then there is nothing more to say.
+            self._flush_dump(complete_only=True)
             return
         self._sniff_buffer.extend(body)
         self._sniff_packets += 1
@@ -424,10 +474,16 @@ class CloudSession:
         self._report_transport()
 
     def _flush_sniff(self) -> None:
-        """Report whatever prefix was buffered when the stream ended mid-sniff."""
-        if not self._ffmpeg_stderr or self._sniffed or not self._sniff_buffer:
+        """Report whatever prefix was buffered when the stream ended mid-sniff.
+
+        The dump here is not held back for a full set of packets: a session that ended after
+        three of them is still explained by those three.
+        """
+        if not self._ffmpeg_stderr:
             return
-        self._report_transport()
+        if not self._sniffed and self._sniff_buffer:
+            self._report_transport()
+        self._flush_dump()
 
     def _report_transport(self) -> None:
         """Classify the buffered prefix and log it once, with where its signature sits."""
@@ -438,6 +494,7 @@ class CloudSession:
             return
         self._sniffed = True
         transport, offset = classify_payload(data)
+        self._transport = transport
         _LOGGER.info(
             "[FFmpeg] %spayload transport=%s at offset=%d head=%s",
             self._label(),
@@ -445,6 +502,59 @@ class CloudSession:
             offset,
             data[:24].hex(" "),
         )
+        self._flush_dump(complete_only=True)
+
+    def _flush_dump(self, *, complete_only: bool = False) -> None:
+        """Log the leading packets individually, for a payload the remux cannot use.
+
+        Only when the transport is not MPEG-PS: a PS stream needs none of this, and FFmpeg
+        identifies its codec on its own, so the noise would buy nothing. For anything else
+        the open question is exactly where the video starts and what codec it is, and both
+        are answered by a few consecutive packets, each with its header fields, its leading
+        bytes, and the payload sliced out at the offset pyezvizapi's `rtp_payload` computes.
+        That the offset is computed by the library's function and not here is the point: it
+        is the same unwrap a fix would use, so the log shows what it would produce.
+
+        `complete_only` is what keeps "the first eight packets" from meaning "however many had
+        arrived when the verdict did": the byte threshold can fire on the third packet, and a
+        dump taken then would answer the question with the least evidence available. The
+        verdict itself is never held back -- only the packet dump is.
+        """
+        if self._dumped or self._transport is None or not self._dump_bodies:
+            return
+        if self._transport == "MPEG_PS":
+            # Nothing to show, and no reason to hold eight packet bodies for a session.
+            self._dump_bodies.clear()
+            return
+        if complete_only and len(self._dump_bodies) < _PACKET_DUMP_PACKETS:
+            return
+        self._dumped = True
+        for index, body in enumerate(self._dump_bodies):
+            _LOGGER.info(
+                "[FFmpeg] %spacket[%d] len=%d rtp=%s head=%s",
+                self._label(),
+                index,
+                len(body),
+                _describe_rtp_header(body),
+                body[:_PACKET_DUMP_HEAD].hex(" "),
+            )
+            try:
+                payload = rtp_payload(body)
+            except PyEzvizError as err:
+                _LOGGER.info(
+                    "[FFmpeg] %spacket[%d] rtp payload: %s",
+                    self._label(),
+                    index,
+                    err,
+                )
+                continue
+            _LOGGER.info(
+                "[FFmpeg] %spacket[%d] rtp payload+%d=%s",
+                self._label(),
+                index,
+                len(body) - len(payload),
+                payload[:_PACKET_DUMP_PAYLOAD].hex(" "),
+            )
 
     def _pump_vtm_to_ffmpeg(self, stream: Any, ffmpeg: subprocess.Popen[bytes]) -> None:
         """VTM packets -> FFmpeg stdin, until the stream ends or the session aborts."""

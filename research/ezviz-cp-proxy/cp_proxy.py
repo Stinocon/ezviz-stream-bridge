@@ -210,8 +210,10 @@ class Relay:
         upstream.close()
         for handle in dumps.values():
             handle.close()
-        self.emit({"t": dt.datetime.now(dt.UTC).isoformat(), "event": "close", "conn": conn_id,
-                   "detail": f"{server_ip}:{server_port}  open={round(time.monotonic()-started,2)}s "
+        self.emit({"t": dt.datetime.now(dt.UTC).isoformat(), "event": "close",
+                   "conn": conn_id,
+                   "detail": f"{server_ip}:{server_port}  "
+                             f"open={round(time.monotonic()-started,2)}s "
                              f"cam->srv={stats['c2s_bytes']}B/{stats['c2s_segs']}seg "
                              f"srv->cam={stats['s2c_bytes']}B/{stats['s2c_segs']}seg"})
 
@@ -279,7 +281,8 @@ class ReplayServer:
                            "conn": conn_id, "detail": f"turn {index} in={len(turn)}B "
                            f"head={turn[:16].hex()}"})
                 if cam_dump and turn:
-                    cam_dump.write(turn); cam_dump.flush()
+                    cam_dump.write(turn)
+                    cam_dump.flush()
                 if self.pcap and turn:
                     self.pcap.write(conn_id, True, turn, peer[0], "10.0.0.1", 8666)
                 if not turn:
@@ -369,7 +372,7 @@ def main() -> int:
 
     server = socket.socket()
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("0.0.0.0", args.listen_port))  # REDIRECT target; must not be loopback-only
+    server.bind(("0.0.0.0", args.listen_port))  # noqa: S104 - REDIRECT target, not loopback-only
     server.listen(32)
     print(f"{mode} on :{args.listen_port}  outdir={outdir}  "
           f"payload={'on' if args.log_payload else 'off'}  pcap={'on' if args.pcap else 'off'}",

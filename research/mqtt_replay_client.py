@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import argparse
 import socket
+import sys
 import time
+from pathlib import Path
 
 
 def decode_connack(data: bytes) -> str:
@@ -40,8 +42,11 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=8.0)
     args = ap.parse_args()
 
-    payload = bytes.fromhex(open(args.connect_hex_file).read().strip())
-    assert payload[0] == 0x10, "not an MQTT CONNECT (first byte != 0x10)"
+    with Path(args.connect_hex_file).open() as handle:
+        payload = bytes.fromhex(handle.read().strip())
+    if payload[0] != 0x10:
+        print("not an MQTT CONNECT (first byte != 0x10)", file=sys.stderr)
+        return 2
     print(f"replaying {len(payload)}B CONNECT to {args.host}:{args.port}", flush=True)
 
     t0 = time.monotonic()

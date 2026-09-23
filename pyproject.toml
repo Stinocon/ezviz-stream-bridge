@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ezviz-stream-bridge"
-version = "0.1.6"
+version = "0.1.7"
 description = "Serve EZVIZ camera video as local MPEG-TS for go2rtc, Frigate and Home Assistant"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -49,6 +49,10 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "S", "C4", "RET", "SIM", "PL"]
 # protocol code costs more readability than it buys. They also bind a listening socket
 # to receive broadcast replies, which is the point of a discovery probe.
 "tools/*" = ["PLR2004", "PLR0912", "PLR0915", "S104"]
+# The same argument as the probes above, for the control-plane investigation that came before
+# them: these are one-off scripts whose long signatures name wire fields one by one and whose
+# numbers are protocol constants. Both read worse packed or named away from the parsing step.
+"research/*" = ["PLR0913", "PLR0917", "PLR0915", "PLR2004"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

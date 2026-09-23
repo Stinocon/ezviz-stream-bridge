@@ -105,8 +105,14 @@ This project is the part that has to keep working for weeks unattended:
   at `info` and its output logged, bounded to 20 lines and then a single suppression notice. It
   also reports the detected payload transport (MPEG-PS, MPEG-TS, RTP or unknown) and where its
   signature sits in the leading payload — buffered across VTM packets, so a packet boundary
-  cannot hide an MPEG-PS or MPEG-TS signature. This is the first thing to turn on when a camera
-  sends video but no MPEG-TS comes out.
+  cannot hide an MPEG-PS or MPEG-TS signature. When the transport is anything but MPEG-PS it goes
+  further and prints the first eight packets of the session — or all of them, if the session ends
+  first: the length, the RTP header fields decoded, the leading bytes, and the payload sliced out
+  at the offset `pyezvizapi`'s own unwrap computes. That last line is the one that answers the
+  useful question — where the video starts and what codec it is — which a 24-byte head cannot,
+  since an RTP header alone is 12 bytes plus up to 60 bytes of CSRC list plus a variable-length
+  extension. This is the first thing to turn on when a camera sends video but no MPEG-TS comes
+  out.
 - **Timestamps you can line up with other logs.** Every line carries an ISO-8601 local time to
   the millisecond, and each session reports `session opened`, `first-video` (the camera starting
   to send) and `first-byte` (the consumer starting to receive), so a wake-up can be measured
@@ -151,7 +157,8 @@ connection's lifecycle: `python -m ezviz_stream_bridge.proxy --help`. `--first-v
 sets the no-video budget (`0` disables it, restoring the pre-0.1.3 behaviour of waiting
 indefinitely), `--timeout-cooldown` sets how long a new session is withheld after a camera
 timeout (`0` disables it), and `--log-level debug` adds the consumer's request headers to the log.
-`--log-ffmpeg-stderr` captures FFmpeg's own diagnostics when a stream produces no output.
+`--log-ffmpeg-stderr` captures FFmpeg's own diagnostics when a stream produces no output, and with
+it the leading packets of any payload that is not MPEG-PS.
 
 ## Investigation tools
 
