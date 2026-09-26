@@ -1674,3 +1674,34 @@ def test_the_watchdog_gives_the_audio_up_while_the_pump_is_blocked(monkeypatch) 
         stop.set()
         pump.join(timeout=SETTLE)
         watcher.join(timeout=SETTLE)
+
+
+def test_giving_the_audio_up_mid_packet_loses_frames_not_the_session(monkeypatch) -> None:
+    """The watchdog can fire between `owns_audio` and the write, and that has to cost a frame.
+
+    `owns_audio` checks that the input is there, and the write used to look at the attribute
+    again -- with the whole Access Unit parse in between. A give-up landing there raised
+    `AttributeError` on `None`, which is neither an OSError nor a ValueError: it escaped the
+    guard, reached the pump's `except Exception` and ended the session with a spurious error at
+    exactly the moment the watchdog was rescuing it. The reference is bound once now.
+    """
+    audio = io.BytesIO()
+    sinks = session_module._Sinks(
+        video=io.BytesIO(),
+        depacketizer=None,
+        audio=audio,
+        audio_depacketizer=AacHbrDepacketizer(payload_type=104),
+    )
+    parse = sinks.audio_depacketizer.feed
+
+    def parse_then_give_up(body: bytes) -> bytes:
+        frames = parse(body)
+        sinks.give_up_audio()  # the watchdog, between the parse and the write
+        return frames
+
+    monkeypatch.setattr(sinks.audio_depacketizer, "feed", parse_then_give_up)
+
+    sinks.feed(audio_packet(bytes(8)))  # must not raise
+
+    assert sinks.audio is None
+    assert audio.closed

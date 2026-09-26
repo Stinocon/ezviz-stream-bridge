@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import socket
 import threading
+from pathlib import Path
 
 import pytest
 
-from ezviz_stream_bridge.proxy import PEER_POLL_INTERVAL, ProxyServer, watch_peer
+from ezviz_stream_bridge.proxy import PEER_POLL_INTERVAL, ProxyServer, _parse_args, watch_peer
 from ezviz_stream_bridge.session import CloudSession
 
 
@@ -180,3 +181,37 @@ def test_wait_for_cooldown_returns_when_the_consumer_has_gone() -> None:
     server.wait_for_cooldown(session)
     assert clock.now() == before  # returned immediately, no sleep
     server.server_close()
+
+
+def _audio_window_args(tmp_path: Path, value: str) -> list[str]:
+    return [
+        "--serial",
+        "BB1234567",
+        "--port",
+        "8558",
+        "--token-file",
+        str(tmp_path / "ezviz_token.json"),
+        "--region",
+        "apiieu.ezvizlife.com",
+        "--audio-window",
+        value,
+    ]
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-1", "2s"])
+def test_a_bad_audio_window_is_refused_at_the_command_line(
+    tmp_path: Path, value: str
+) -> None:
+    """The add-on options refuse these, and the command line has to agree: the same number
+    getting two verdicts depending on the door is how `nan` -- which disarms every comparison
+    it is used in, including the deadline it sets -- reaches a session. The add-on passes this
+    option as a flag, so that is the door that actually gets used."""
+    with pytest.raises(SystemExit):
+        _parse_args(_audio_window_args(tmp_path, value))
+
+
+@pytest.mark.parametrize("value", ["0", "1.5", "0.25"])
+def test_a_good_audio_window_survives_the_command_line(tmp_path: Path, value: str) -> None:
+    args = _parse_args(_audio_window_args(tmp_path, value))
+
+    assert args.audio_window == float(value)

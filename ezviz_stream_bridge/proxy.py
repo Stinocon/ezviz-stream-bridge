@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import logging
+import math
 import select
 import socket
 import threading
@@ -326,6 +327,24 @@ def _load_client(token_file: Path, region: str) -> EzvizClient:
     return EzvizClient(token=token, url=region)
 
 
+def _finite_seconds(text: str) -> float:
+    """A duration argument that is a finite, non-negative number of seconds.
+
+    `float()` accepts `nan` and `inf`, and every comparison against them is then False -- so an
+    `--audio-window nan` would disarm the deadline it was meant to set, which is the one thing
+    that number exists to bound. The add-on options go through `BridgeConfig._as_seconds`, which
+    refuses both; a value typed on the command line has to meet the same rule or the two doors
+    disagree about what a duration is.
+    """
+    try:
+        value = float(text)
+    except ValueError as err:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number of seconds") from err
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a finite number of seconds")
+    return value
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="ezviz-stream-bridge-proxy",
@@ -359,7 +378,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--audio-window",
-        type=float,
+        type=_finite_seconds,
         default=DEFAULT_AUDIO_WINDOW,
         help=(
             "seconds to keep reading the leading packets for the camera's audio before "

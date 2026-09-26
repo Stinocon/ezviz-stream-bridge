@@ -305,14 +305,21 @@ class _Sinks:
         audio = self.audio_depacketizer
         if audio is not None and self.owns_audio(body):
             frames = audio.feed(body)
-            if frames:
+            # Bound once, and after the parse rather than at the check above. The watchdog may
+            # have given the input up while those bytes were being unpacked, and re-reading the
+            # attribute here would be the one thing this path cannot afford: an AttributeError
+            # on `None` is not an OSError, so it would escape the guard below, reach the pump's
+            # `except Exception` and take the whole session down -- video included -- at exactly
+            # the moment the watchdog was saving it. A bound reference to an already-closed file
+            # raises ValueError instead, which is handled.
+            pipe = self.audio
+            if frames and pipe is not None:
                 try:
-                    self.audio.write(frames)
-                    self.audio.flush()
+                    pipe.write(frames)
+                    pipe.flush()
                 except (OSError, ValueError):
-                    # The watchdog gave the input up between the check above and here. Those
-                    # frames are lost -- the session has already decided it has no audio -- and
-                    # the video is what must not be.
+                    # Given up between the bind and here. The frames are lost -- the session has
+                    # already decided it has no audio -- and the video is what must not be.
                     return
                 self.audio_at = self.now()
             return
@@ -324,9 +331,11 @@ class _Sinks:
     def give_up_audio(self) -> bool:
         """Release the audio input, once. False when there is nothing left to give up.
 
-        Called from the watchdog thread while the pump may be writing, so the descriptor is
-        dropped before it is closed: the pump's own write then sees `None`, or raises, and
-        either way it is the frames that are lost and not the session.
+        Called from the watchdog thread while the pump may be writing, so the reference is
+        dropped before the descriptor is closed: the pump then loses frames rather than the
+        session. Dropping it first is also what keeps `feed` from writing through a reference
+        that is already closed, and closing the file object rather than the descriptor means a
+        later write cannot land on a recycled descriptor number -- the object knows it is shut.
         """
         target, self.audio = self.audio, None
         if target is None:
