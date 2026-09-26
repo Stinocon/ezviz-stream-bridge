@@ -360,7 +360,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--log-level", default="info")
     parser.add_argument(
         "--first-video-timeout",
-        type=float,
+        type=_finite_seconds,
         default=DEFAULT_FIRST_VIDEO_TIMEOUT,
         help=(
             "seconds to wait for the camera's first video packet before closing the "
@@ -369,7 +369,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--timeout-cooldown",
-        type=float,
+        type=_finite_seconds,
         default=TIMEOUT_COOLDOWN,
         help=(
             "seconds to wait after a camera timeout before opening a new VTM session "

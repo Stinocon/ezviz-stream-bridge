@@ -123,6 +123,22 @@ _AAC_FREQUENCIES = (
     16000, 12000, 11025, 8000, 7350,
 )
 
+# The three fields of an AudioSpecificConfig this reads or writes: an object type, a sampling
+# frequency index and a channel configuration, each in its documented place beside the three
+# GASpecificConfig bits that follow and that nothing here changes.
+_AAC_OBJECT_TYPE_SHIFT = 11
+_AAC_FREQUENCY_SHIFT = 7
+_AAC_CHANNELS_SHIFT = 3
+_AAC_CHANNELS_MASK = 0x07 << _AAC_CHANNELS_SHIFT
+
+# The element ids a raw_data_block can open with, as far as the channel count goes: an SCE
+# carries one channel and a CPE a pair. Anything else opening the block -- a fill element, a
+# program config element, a coupling channel -- says nothing about the layout, and an encoder's
+# primer frame is exactly that: FFmpeg's AAC encoder opens with a fill element alone (measured),
+# which is why one reading is not enough and the scan below keeps looking.
+_AAC_ELEMENT_CHANNELS = {0: 1, 1: 2}
+_AAC_ELEMENT_BITS = 3
+
 # ADTS, the framing FFmpeg's `aac` demuxer reads and the only one it reads. Its frame_length
 # field is 13 bits and counts the header, so this is the largest Access Unit it can describe.
 _ADTS_HEADER_BYTES = 7
@@ -522,9 +538,9 @@ def adts_frame(unit: bytes, config: int = AAC_LC_16K_MONO) -> bytes:
     zero. Neither carries anything for a stream being remuxed, and any other value would be an
     invented measurement in a header that FFmpeg has no reason to disbelieve.
     """
-    profile = ((config >> 11) & 0x1F) - 1
-    frequency = (config >> 7) & 0x0F
-    channels = (config >> 3) & 0x07
+    profile = ((config >> _AAC_OBJECT_TYPE_SHIFT) & 0x1F) - 1
+    frequency = (config >> _AAC_FREQUENCY_SHIFT) & 0x0F
+    channels = (config >> _AAC_CHANNELS_SHIFT) & 0x07
     length = len(unit) + _ADTS_HEADER_BYTES
     return (
         bytes(
@@ -556,6 +572,25 @@ def carries_aac_hbr(payload: bytes) -> bool:
     return units is not None and all(len(unit) <= _ADTS_MAX_AU_BYTES for unit in units)
 
 
+def stream_channels(unit: bytes) -> int | None:
+    """The channels an Access Unit's own first element names, or None if it names none.
+
+    The one part of the audio configuration that is readable from the payload. An Access Unit is
+    a `raw_data_block`, and its first three bits are the element id: 0 is a single channel
+    element and 1 a channel pair element, which is the difference between mono and stereo. The
+    sample rate is not in there at all, which is why the config still comes from the family's
+    SDP convention and only this part is refined from the bytes.
+    """
+    if not unit:
+        return None
+    return _AAC_ELEMENT_CHANNELS.get(unit[0] >> (8 - _AAC_ELEMENT_BITS))
+
+
+def set_channels(config: int, channels: int) -> int:
+    """The same AudioSpecificConfig with a different channel configuration."""
+    return (config & ~_AAC_CHANNELS_MASK) | ((channels << _AAC_CHANNELS_SHIFT) & _AAC_CHANNELS_MASK)
+
+
 def describe_config(config: int = AAC_LC_16K_MONO) -> str:
     """The AudioSpecificConfig spelled out, for a log line somebody has to be able to check.
 
@@ -564,9 +599,9 @@ def describe_config(config: int = AAC_LC_16K_MONO) -> str:
     Printing the rate and the channel count is what turns "the audio is wrong on my camera"
     into a number somebody can compare against that same camera's RTSP SDP.
     """
-    object_type = (config >> 11) & 0x1F
-    frequency = (config >> 7) & 0x0F
-    channels = (config >> 3) & 0x07
+    object_type = (config >> _AAC_OBJECT_TYPE_SHIFT) & 0x1F
+    frequency = (config >> _AAC_FREQUENCY_SHIFT) & 0x0F
+    channels = (config >> _AAC_CHANNELS_SHIFT) & 0x07
     name = _AAC_OBJECT_TYPES.get(object_type, f"object type {object_type}")
     if frequency < len(_AAC_FREQUENCIES):
         rate = f"{_AAC_FREQUENCIES[frequency]} Hz"
@@ -593,7 +628,7 @@ class AacHbrDepacketizer:
     def __init__(
         self, *, config: int = AAC_LC_16K_MONO, payload_type: int | None = None
     ) -> None:
-        object_type = (config >> 11) & 0x1F
+        object_type = (config >> _AAC_OBJECT_TYPE_SHIFT) & 0x1F
         if not 1 <= object_type <= _ADTS_MAX_OBJECT_TYPE:
             # The header below builds `object_type - 1` into two bits, which is a lie for an
             # object type the field cannot hold. Refusing here keeps that from being a stream

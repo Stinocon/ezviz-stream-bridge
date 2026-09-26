@@ -35,6 +35,8 @@ from __future__ import annotations
 import logging
 import subprocess
 import sys
+import threading
+import time
 
 sys.path.insert(0, "/src")
 
@@ -164,18 +166,33 @@ class FakePacket:
 
 
 class FakeVtm:
-    """Just enough of VtmStreamClient for `CloudSession.run`: the packets, then the end."""
+    """Just enough of VtmStreamClient for `CloudSession.run`: the packets, then the end.
 
-    def __init__(self, packets: list[bytes]) -> None:
-        self._packets = packets
+    `events` are `(seconds, body)` pairs on one timeline, so a session can be fed at the pace a
+    camera feeds it. That pacing is not decoration: the audio window and the watchdog are both
+    about time, and a stream handed over in one burst has neither.
+    """
+
+    def __init__(self, events: list[tuple[float, bytes]], release: threading.Event | None = None):
+        self._events = events
+        self._release = release
         self.closed = False
 
     def start(self) -> None:
         return None
 
     def iter_packets(self, **_kwargs: object):
-        for body in self._packets:
+        started = time.monotonic()
+        for at, body in self._events:
+            delay = at - (time.monotonic() - started)
+            if delay > 0:
+                time.sleep(delay)
             yield FakePacket(body)
+        if self._release is not None:
+            # A camera that is still streaming. Returning here would end the stream, FFmpeg
+            # would flush everything at EOF and the question this exists to answer -- did the
+            # video come back *while* the audio was gone -- would be lost in the flush.
+            self._release.wait(60)
 
     def close(self) -> None:
         self.closed = True
@@ -211,7 +228,7 @@ def run_session(packets: list[bytes]) -> tuple[bytes, list[str]]:
     whole local path runs -- the prefix read, the audio window, the plan, the argv, both pipes
     and the teardown -- because that path is the thing being verified.
     """
-    stream = FakeVtm(packets)
+    stream = FakeVtm([(0.0, body) for body in packets])
     session_module.open_cloud_stream = lambda *_args, **_kwargs: stream
     sink = Sink()
     collected = Collected()
@@ -353,6 +370,108 @@ def probe_audio(video_source_argv: list[str], audio_source_argv: list[str]) -> N
     assert "was not served" not in " ".join(lines), "the audio was measured but not served"
 
 
+def probe_audio_stall(video_source_argv: list[str], audio_source_argv: list[str]) -> None:
+    """The audio that stops mid-session: the video has to survive it.
+
+    FFmpeg reads a packet from every input before it muxes any, so an input the camera has
+    stopped feeding is not silence to it -- its demuxer thread blocks in `read`, the muxer waits
+    behind that stream and nothing comes out at all while the camera keeps streaming. The
+    watchdog gives that input up after a few seconds of silence; a thread does it because the
+    pump is blocked writing by then.
+
+    Both halves are checked here against the ffmpeg the add-on installs: that the session ends
+    the audio input, and that video arrives *afterwards* -- during the run, not in the flush at
+    the end, which is the difference between a stream that recovered and one that only looked
+    like it had.
+    """
+    video = video_packets(H264, subprocess.run(video_source_argv, capture_output=True,
+                                               check=True).stdout)
+    adts = subprocess.run(audio_source_argv, capture_output=True, check=True).stdout
+    audio = audio_packets(split_adts(adts))
+    assert video and audio, "the synthetic streams produced nothing to pace"
+
+    # One timeline: video from the start to well past the stall, audio only for its first
+    # second. 25 packets a second of video is what makes this the case the watchdog exists for
+    # rather than a comfortable one -- at a realistic bitrate the video pipe fills within a
+    # second, so by the time the audio has been silent long enough, the pump is blocked in
+    # `stdin.write` and cannot make the decision itself.
+    video_until, audio_until, audio_from = 14.0, 1.2, 0.35
+    events: list[tuple[float, bytes]] = [
+        (index / 25.0, video[index % len(video)]) for index in range(int(video_until * 25))
+    ]
+    events += [
+        (audio_from + index / (len(audio) / (audio_until - audio_from)), audio[index % len(audio)])
+        for index in range(len(audio))
+    ]
+    events.sort(key=lambda event: event[0])
+
+    stall_seconds = 0.6
+    released = session_module._AUDIO_STALL_SECONDS  # noqa: SLF001 - the wait is the subject
+    release = threading.Event()
+    stream = FakeVtm(events, release=release)
+    session_module.open_cloud_stream = lambda *_args, **_kwargs: stream
+    session_module._AUDIO_STALL_SECONDS = stall_seconds  # noqa: SLF001 - and it is shortened
+
+    class TimedSink(Sink):
+        """Keeps when each byte arrived, because the question is about time."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.writes: list[tuple[float, int]] = []
+
+        def write(self, chunk: bytes) -> int:
+            written = super().write(chunk)
+            self.writes.append((time.monotonic(), len(self.data)))
+            return written
+
+    sink = TimedSink()
+    collected = Collected()
+    logging.getLogger("ezviz_stream_bridge.session").addHandler(collected)
+    logging.getLogger("ezviz_stream_bridge.session").setLevel(logging.INFO)
+    session = session_module.CloudSession(
+        object(), "VERIFY", ffmpeg_path="ffmpeg", first_video_timeout=0
+    )
+    started = time.monotonic()
+    runner = threading.Thread(target=session.run, args=(sink,), daemon=True)
+    runner.start()
+
+    # The audio stops at `audio_until`; the watchdog fires `stall_seconds` later, and what is
+    # waited for is a write after that. The deadline is generous because the draining of an
+    # already-queued video takes a few seconds on its own.
+    guard_at = audio_until + stall_seconds
+    deadline = time.monotonic() + 30.0
+    try:
+        while time.monotonic() < deadline:
+            late = [at for at, _ in sink.writes if at - started > guard_at]
+            if late:
+                break
+            time.sleep(0.1)
+    finally:
+        late = [at - started for at, _ in sink.writes if at - started > guard_at]
+        release.set()
+        session.abort("verification done")
+        runner.join(timeout=10.0)
+        logging.getLogger("ezviz_stream_bridge.session").removeHandler(collected)
+        session_module._AUDIO_STALL_SECONDS = released  # noqa: SLF001
+
+    stalled = [line for line in collected.lines if "nothing from the camera for" in line]
+    if late:
+        print(
+            f"stall: audio stopped at +{audio_until:.1f}s, watchdog at +{guard_at:.1f}s, "
+            f"{len(late)} write(s) after it, the first at +{min(late):.1f}s"
+        )
+    else:
+        print(f"stall: nothing was written after +{guard_at:.1f}s")
+    assert stalled, f"the audio input was never given up: {collected.lines[-3:]}"
+    assert late, (
+        "the video never came back: the audio input was given up and the mux stayed stopped"
+    )
+    assert sink.data, "the session produced no MPEG-TS at all"
+    found = " ".join(sorted(set(ffprobe(bytes(sink.data), "stream=codec_name").split())))
+    print(f"  and what it produced still carries {found!r}")
+    assert "h264" in found, f"the recovered stream carries {found!r}"
+
+
 def main() -> int:
     version = subprocess.run(
         ["ffmpeg", "-hide_banner", "-version"], capture_output=True, check=True
@@ -372,13 +491,17 @@ def main() -> int:
         ["ffmpeg", *common, "-c:v", "libx265", "-x265-params", "log-level=error",
          "-f", "hevc", "pipe:1"],
     )
-    probe_audio(
-        h264,
-        # 16 kHz mono, which is what `config=1408` describes: the same config the bridge
-        # rebuilds ADTS from, so a frame count mismatch here would be a real disagreement.
+    audio = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000", "-t", "1",
+             "-c:a", "aac", "-ar", "16000", "-ac", "1", "-f", "adts", "pipe:1"]
+    # 16 kHz mono, which is what `config=1408` describes: the same config the bridge rebuilds
+    # ADTS from, so a frame count mismatch here would be a real disagreement.
+    probe_audio(h264, audio)
+    probe_audio_stall(
         ["ffmpeg", "-hide_banner", "-loglevel", "error",
-         "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000", "-t", "1",
-         "-c:a", "aac", "-ar", "16000", "-ac", "1", "-f", "adts", "pipe:1"],
+         "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25", "-t", "1",
+         "-pix_fmt", "yuv420p", "-c:v", "libx264", "-b:v", "800k", "-f", "h264", "pipe:1"],
+        audio,
     )
     print("VERIFICATION OK")
     return 0

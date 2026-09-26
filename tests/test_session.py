@@ -1705,3 +1705,212 @@ def test_giving_the_audio_up_mid_packet_loses_frames_not_the_session(monkeypatch
 
     assert sinks.audio is None
     assert audio.closed
+
+
+def cpe_packet(size: int = 32) -> bytes:
+    """An audio packet whose Access Unit opens with a channel pair element: stereo audio."""
+    return audio_packet(bytes([0b001_00000]) + bytes(size - 1))
+
+
+def test_the_channel_count_is_read_from_the_camera_s_own_bytes(vtm, two_input_ffmpeg, caplog):
+    """The sample rate is not in the payload, so the config has to come from the family's SDP
+    convention -- but the channel count is readable: an Access Unit opens with its element id.
+    A stereo camera whose stream is framed with the mono default comes out of the mux as a
+    broken pair of channels, and no amount of convention prevents that. The bytes do."""
+    caplog.set_level(logging.INFO)
+    ffmpeg_path, _, audio_file = two_input_ffmpeg
+    unit = bytes([0b001_00000]) + bytes(255)
+    vtm(
+        [
+            video(rtp_packet(SPS_PAYLOAD, payload_type=96)),
+            video(cpe_packet(256)),
+            video(cpe_packet(256)),
+        ],
+        silent_after=False,
+    )
+    session = CloudSession(object(), "BB1234567", ffmpeg_path=ffmpeg_path, first_video_timeout=0)
+
+    thread, errors = run_in_thread(session, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert audio_file.read_bytes() == adts_frame(unit, 0x1410) * 2, (
+        "the ADTS frames declare the stereo the Access Units actually carry"
+    )
+    line = next(line for line in _diagnostic_lines(caplog) if " audio:" in line)
+    assert "config=0x1410" in line
+    assert "AAC-LC, 16000 Hz, 2 channels" in line
+    assert "channels read from the stream" in line
+
+
+def test_a_primer_fill_element_does_not_decide_the_channel_count(
+    vtm, two_input_ffmpeg, caplog
+) -> None:
+    """FFmpeg's own AAC encoder opens a stream with a fill element that names no channel, so a
+    reading taken from the first Access Unit alone would say "no channels" on an ordinary
+    stereo stream. The scan keeps looking through the packets the session already parsed."""
+    caplog.set_level(logging.INFO)
+    ffmpeg_path, _, audio_file = two_input_ffmpeg
+    primer = bytes([0b110_00000]) + bytes(63)
+    stereo = bytes([0b001_00000]) + bytes(63)
+    vtm(
+        [
+            video(rtp_packet(SPS_PAYLOAD, payload_type=96)),
+            video(audio_packet(primer)),
+            video(audio_packet(stereo)),
+        ],
+        silent_after=False,
+    )
+    session = CloudSession(object(), "BB1234567", ffmpeg_path=ffmpeg_path, first_video_timeout=0)
+
+    thread, errors = run_in_thread(session, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert audio_file.read_bytes() == (
+        adts_frame(primer, 0x1410) + adts_frame(stereo, 0x1410)
+    ), "both frames declare the stereo the second Access Unit named"
+    line = next(line for line in _diagnostic_lines(caplog) if " audio:" in line)
+    assert "channels read from the stream" in line, "the second Access Unit is the one that says"
+
+
+def test_a_channel_count_nothing_in_the_prefix_names_is_declared_as_a_default(
+    vtm, two_input_ffmpeg, caplog
+) -> None:
+    """When no Access Unit in the prefix names a channel, the session uses the family's default
+    -- and says so, because four hex digits otherwise look the same whether they were read from
+    the camera or assumed on its behalf."""
+    caplog.set_level(logging.INFO)
+    ffmpeg_path, _, audio_file = two_input_ffmpeg
+    primer = bytes([0b110_00000]) + bytes(63)
+    vtm(
+        [video(rtp_packet(SPS_PAYLOAD, payload_type=96)), video(audio_packet(primer))],
+        silent_after=False,
+    )
+    session = CloudSession(object(), "BB1234567", ffmpeg_path=ffmpeg_path, first_video_timeout=0)
+
+    thread, errors = run_in_thread(session, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert audio_file.read_bytes() == adts_frame(primer)  # the mono default, unchanged
+    line = next(line for line in _diagnostic_lines(caplog) if " audio:" in line)
+    assert "config=0x1408" in line
+    assert "channels from the family default" in line
+
+
+def test_the_cadence_is_measured_from_the_packets_not_assumed() -> None:
+    """The rate is the one part of the config nothing in the payload carries, so it stays the
+    family's 16 kHz -- and the log has to carry the reading that confirms or contradicts it,
+    which is the interval between the packets the session actually received."""
+    clock = [100.0]
+    session = CloudSession(object(), "BB1234567", monotonic=lambda: clock[0])
+    for _ in range(3):
+        session._accept(FakePacket(channel=VtmChannel.STREAM, body=audio_packet(bytes(8))))
+        clock[0] += 0.064
+
+    cadence = session._packet_cadence(104)
+
+    assert "3 packet(s) over 0.1s" in cadence
+    assert "64.0 ms each" in cadence
+    assert "16.0 kHz" in cadence
+
+
+def test_a_cadence_needs_more_than_one_packet_to_mean_anything() -> None:
+    session = CloudSession(object(), "BB1234567")
+
+    assert session._packet_cadence(104) == ""
+    session._accept(FakePacket(channel=VtmChannel.STREAM, body=audio_packet(bytes(8))))
+    assert session._packet_cadence(104) == ""
+
+
+def test_the_window_reads_on_until_the_audio_says_what_it_is(
+    vtm, two_input_ffmpeg, caplog
+) -> None:
+    """Finding the audio and knowing what it is are two questions, and the first answer is not
+    the second: the packet that ends the wait can be the one that says nothing about channels.
+    The window keeps reading until an Access Unit names one, which is what makes the channel
+    count a reading rather than a default on a camera whose first frame is a fill element."""
+    caplog.set_level(logging.INFO)
+    ffmpeg_path, _, audio_file = two_input_ffmpeg
+    primer = bytes([0b110_00000]) + bytes(63)
+    stereo = bytes([0b001_00000]) + bytes(63)
+    packets = [video(rtp_packet(SPS_PAYLOAD, payload_type=96))]
+    packets += [
+        video(rtp_packet(b"\x41\x9a\x00" + bytes(index), payload_type=96)) for index in range(7)
+    ]
+    vtm(
+        [*packets, video(audio_packet(primer)), video(audio_packet(stereo))],
+        silent_after=False,
+    )
+    session = CloudSession(object(), "BB1234567", ffmpeg_path=ffmpeg_path, first_video_timeout=0)
+
+    thread, errors = run_in_thread(session, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert audio_file.read_bytes() == (
+        adts_frame(primer, 0x1410) + adts_frame(stereo, 0x1410)
+    )
+    line = next(line for line in _diagnostic_lines(caplog) if " audio:" in line)
+    assert "channels read from the stream" in line
+
+
+def test_audio_in_the_prefix_reads_on_when_its_first_frame_names_no_channel(
+    vtm, two_input_ffmpeg, caplog
+) -> None:
+    """The fast path is not allowed to skip the reading.
+
+    When the audio is already inside the eight packets the demuxer is chosen from, there is
+    nothing to wait for -- but "it is here" and "we know what it is" are two questions, and
+    returning on the first one locks the family's mono default into a session whose *second*
+    Access Unit says stereo. Timing decides which of the two paths is taken, and it must not
+    decide the answer.
+    """
+    caplog.set_level(logging.INFO)
+    ffmpeg_path, _, audio_file = two_input_ffmpeg
+    primer = bytes([0b110_00000]) + bytes(63)
+    stereo = bytes([0b001_00000]) + bytes(63)
+    packets = [video(rtp_packet(SPS_PAYLOAD, payload_type=96))]
+    packets += [
+        video(rtp_packet(b"\x41\x9a\x00" + bytes(index), payload_type=96)) for index in range(6)
+    ]
+    # Seven video packets and the audio's first frame: the audio is in the prefix, and the only
+    # Access Unit in that prefix names no channel.
+    vtm(
+        [*packets, video(audio_packet(primer)), video(audio_packet(stereo))],
+        silent_after=False,
+    )
+    session = CloudSession(object(), "BB1234567", ffmpeg_path=ffmpeg_path, first_video_timeout=0)
+
+    thread, errors = run_in_thread(session, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert audio_file.read_bytes() == (
+        adts_frame(primer, 0x1410) + adts_frame(stereo, 0x1410)
+    )
+    line = next(line for line in _diagnostic_lines(caplog) if " audio:" in line)
+    assert "config=0x1410" in line
+    assert "channels read from the stream" in line
+
+
+def test_a_second_video_stream_is_not_reported_as_a_sample_rate() -> None:
+    """The interval between packets is a fact for any payload type; the sample rate it implies
+    is a reading of AAC frames and of nothing else. A second video stream at 25 packets a second
+    has a 40 ms interval, and the plausibility guard cannot tell it from a sample rate -- so the
+    inference is not printed for a type that is only known to have carried media."""
+    session = CloudSession(object(), "BB1234567")
+    # Twenty-six packets over a second: twenty-five gaps of 40 ms, which is 25 packets a second.
+    session._media[113] = session_module._MediaSpan(first=100.0, last=101.0, packets=26)
+
+    measured = session._packet_cadence(113, audio=False)
+
+    assert "40.0 ms each" in measured
+    assert "kHz" not in measured, "nothing there says these are AAC frames"
+    assert "kHz" in session._packet_cadence(113), "on the real audio stream the reading is made"

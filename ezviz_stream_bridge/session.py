@@ -37,7 +37,17 @@ from pyezvizapi.cloud_stream import open_cloud_stream
 from pyezvizapi.exceptions import PyEzvizError
 from pyezvizapi.stream import VtmChannel, rtp_payload
 
-from .rtp import AacHbrDepacketizer, RtpDepacketizer, carries_aac_hbr, describe_config, detect_codec
+from .rtp import (
+    AAC_LC_16K_MONO,
+    AacHbrDepacketizer,
+    RtpDepacketizer,
+    carries_aac_hbr,
+    describe_config,
+    detect_codec,
+    parse_au_section,
+    set_channels,
+    stream_channels,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -69,6 +79,18 @@ DEFAULT_AUDIO_WINDOW = 2.0
 # replayed. It is generous on purpose: the packets are 4 KiB in practice and the deadline is
 # what normally ends the wait, so this only has to be a bound and not a second window.
 _AUDIO_WINDOW_BYTES = 4 * 1024 * 1024
+
+# Fewer packets than this and an interval says nothing: it would be one measurement with no way
+# to tell a real cadence from the gap before the camera started talking.
+_CADENCE_MIN_PACKETS = 2
+
+# An AAC-LC frame is 1024 samples, and the sampling frequencies the format defines run from
+# 7350 Hz to 96 kHz -- so a frame lasts between 10.7 and 139 ms. A span outside that is not a
+# cadence worth printing: it is a session that was handed all of its packets at once, and the
+# rate it would imply is one no encoder can produce. Measured the hard way: the first version
+# of this line reported 722653.5 kHz for a test stream that arrived in a single burst.
+_AAC_FRAME_SAMPLES = 1024
+_AAC_FRAME_SECONDS = (_AAC_FRAME_SAMPLES / 96000, _AAC_FRAME_SAMPLES / 7350)
 
 # Seconds of audio silence after which the audio input is ended, so the video keeps flowing.
 # FFmpeg reads a packet from every input before it muxes any, and the demuxer thread for an
@@ -235,6 +257,48 @@ def _prefix_audio(payload_type: int | None, packets: tuple[bytes, ...]) -> int |
     return None
 
 
+def _audio_channels(payload_type: int | None, packets: tuple[bytes, ...]) -> int | None:
+    """The channel count the camera's own bytes name, from the first Access Unit that names one.
+
+    The first, and not the first Access Unit: an encoder's primer frame is a fill element with
+    no channel of its own -- FFmpeg's own AAC encoder opens with one, measured -- so a reading
+    taken from packet one would be "this says nothing" on a perfectly ordinary stereo stream.
+    Scanning on, inside the packets the session already had to parse, is what makes the reading
+    land instead of falling back to the family's default.
+
+    A payload type of None is not the audio's, whatever the bytes look like: it is how a body
+    that is not an RTP packet is counted, and matching it here would hand the channel count of
+    an unrelated payload to the audio stream.
+    """
+    if payload_type is None:
+        return None
+    for body in packets:
+        if _payload_type_of(body) != payload_type:
+            continue
+        try:
+            units = parse_au_section(rtp_payload(body))
+        except PyEzvizError:
+            continue
+        for unit in units or ():
+            channels = stream_channels(unit)
+            if channels is not None:
+                return channels
+    return None
+
+
+def _audio_config(plan: _PayloadPlan) -> int:
+    """The AudioSpecificConfig for a session: the family's, with what the camera said about it.
+
+    Only the channel count is ever replaced. The sample rate is not in the payload at all -- an
+    Access Unit carries no such field, and the RTP timestamp counts samples rather than naming a
+    rate -- so the rate stays the family's 16 kHz and is cross-checked against the measured
+    cadence where that cadence is reported.
+    """
+    if plan.audio_channels is None:
+        return AAC_LC_16K_MONO
+    return set_channels(AAC_LC_16K_MONO, plan.audio_channels)
+
+
 def _payload_type_of(body: bytes) -> int | None:
     """The RTP payload type of a packet body, or None when it is not an RTP header."""
     if len(body) < _RTP_HEADER_BYTES or (body[0] & _RTP_VERSION_MASK) != _RTP_VERSION_2:
@@ -260,6 +324,21 @@ def _carries_media(body: bytes) -> bool:
             # An RTP-shaped header the unwrap rejects is still something the camera sent.
             return True
     return True
+
+
+@dataclass
+class _MediaSpan:
+    """What one payload type's media looked like in time: first, last, and how many packets.
+
+    One record rather than three parallel dictionaries, because the three numbers are only
+    meaningful together: a packet count without the span says nothing about a cadence, and the
+    span without the count says nothing either. Mutable because it is filled as the session
+    runs, packet by packet, and read once at the end.
+    """
+
+    first: float
+    last: float
+    packets: int = 1
 
 
 @dataclass
@@ -388,6 +467,11 @@ class _PayloadPlan:
     payload_type: int | None
     packets: tuple[bytes, ...]
     audio_payload_type: int | None = None
+    # The channel count the camera's own Access Units named, or None when none of the ones in
+    # the prefix named one. None is not "no channels": it means the family's default is what
+    # this session will use, and the report says so rather than letting the log imply a reading
+    # that was never taken. The sample rate has no such field at all -- see `_audio_config`.
+    audio_channels: int | None = None
 
 
 @dataclass
@@ -439,11 +523,10 @@ class CloudSession:
         # Seconds into the session at which the audio input was given up as stalled, or None.
         self._audio_ended_at: float | None = None
         self._writer_error: Exception | None = None
-        # Seconds into the session at which each payload type first carried media. Recorded for
-        # every type, not only the one being served: a window that turned out to be too short
-        # is corrected from this, and it is the reading that separates "this camera has no
-        # audio" from "this camera's audio started after the bridge stopped waiting".
-        self._media_first: dict[int | None, float] = {}
+        # One `_MediaSpan` per payload type that carried media. Recorded for every type, not only
+        # the one being served: a window that turned out to be too short is corrected from this,
+        # and the span is what a packet rate is measured from.
+        self._media: dict[int | None, _MediaSpan] = {}
 
     @property
     def abort_reason(self) -> str | None:
@@ -813,12 +896,24 @@ class CloudSession:
             # "the audio never arrived" would be the wrong way to put it.
             return plan
         audio_payload_type = _prefix_audio(plan.payload_type, plan.packets)
-        if audio_payload_type is not None:
-            return replace(plan, audio_payload_type=audio_payload_type)
+        channels = (
+            _audio_channels(audio_payload_type, plan.packets)
+            if audio_payload_type is not None
+            else None
+        )
+        if channels is not None:
+            # Both questions answered by the prefix, which is the common case and costs nothing:
+            # a camera that starts its audio with its video puts it inside the eight packets the
+            # demuxer is chosen from. Note that both have to be answered -- finding the audio and
+            # knowing its channel count are different questions, and returning on the first one
+            # would lock in the family's default for a session whose second Access Unit says
+            # otherwise.
+            return replace(
+                plan, audio_payload_type=audio_payload_type, audio_channels=channels
+            )
         deadline = self._now() + self._audio_window
         extra: list[bytes] = []
         buffered = 0
-        audio_payload_type = None
         try:
             for packet in packets_iter:
                 if self._cancel.is_set():
@@ -833,9 +928,21 @@ class CloudSession:
                 if body:
                     extra.append(body)
                     buffered += len(body)
-                    payload_type = _payload_type_of(body)
-                    if payload_type != plan.payload_type and _audio_payload(body):
-                        audio_payload_type = payload_type
+                    if audio_payload_type is None:
+                        candidate = _payload_type_of(body)
+                        if candidate != plan.payload_type and _audio_payload(body):
+                            audio_payload_type = candidate
+                    if audio_payload_type is not None and channels is None:
+                        channels = _audio_channels(
+                            audio_payload_type, plan.packets + tuple(extra)
+                        )
+                    # Read on past the packet that first looked like audio until an Access Unit
+                    # names a channel count. An encoder's primer frame is a fill element that
+                    # names none -- FFmpeg's own AAC encoder opens a stereo stream with one,
+                    # measured -- so stopping at the first audio packet would settle for the
+                    # family's default on a camera that was about to say otherwise. Two frames
+                    # of patience, at 64 ms a frame, and the bounds below still bound it.
+                    if channels is not None:
                         break
                 if self._now() >= deadline or buffered >= _AUDIO_WINDOW_BYTES:
                     break
@@ -845,7 +952,10 @@ class CloudSession:
             if not self._cancel.is_set():
                 raise
         return replace(
-            plan, packets=plan.packets + tuple(extra), audio_payload_type=audio_payload_type
+            plan,
+            packets=plan.packets + tuple(extra),
+            audio_payload_type=audio_payload_type,
+            audio_channels=channels,
         )
 
     def _decide(self, packets: tuple[bytes, ...]) -> _PayloadPlan:
@@ -904,12 +1014,20 @@ class CloudSession:
         self.metrics.video_packets += 1
         body = packet.body
         if body and _carries_media(body):
+            elapsed = self._now() - self._started
             if self.metrics.first_video_at is None:
                 self._record("first-video")
-            # One entry per payload type, the first time each carried media. This is what the
-            # audio window is measured against, and the reading that turns "the audio is
-            # missing" into the one number that says how long a window would have had to be.
-            self._media_first.setdefault(_payload_type_of(body), self._now() - self._started)
+            # The first packet of each payload type that carried media, and the last so far. This
+            # is what the audio window is measured against, and the reading that turns "the
+            # audio is missing" into the one number that says how long a window would have had
+            # to be.
+            payload_type = _payload_type_of(body)
+            span = self._media.get(payload_type)
+            if span is None:
+                self._media[payload_type] = _MediaSpan(first=elapsed, last=elapsed)
+            else:
+                span.last = elapsed
+                span.packets += 1
         return body
 
     def _report_prefix(self, packets: tuple[bytes, ...]) -> None:
@@ -979,7 +1097,9 @@ class CloudSession:
             else None
         )
         audio_depacketizer = (
-            AacHbrDepacketizer(payload_type=plan.audio_payload_type)
+            AacHbrDepacketizer(
+                config=_audio_config(plan), payload_type=plan.audio_payload_type
+            )
             if plan.audio_payload_type is not None
             else None
         )
@@ -1031,7 +1151,7 @@ class CloudSession:
                 stall_watchdog.join(timeout=_AUDIO_STALL_POLL + _WRITER_JOIN_TIMEOUT)
             if depacketizer is not None:
                 self._finish_depacketizer(depacketizer)
-                self._report_audio(audio_depacketizer, plan.payload_type)
+                self._report_audio(audio_depacketizer, plan)
             # Order matters only for tidiness: FFmpeg is already gone, and a write end left
             # open would keep its reader from seeing EOF.
             self._close_audio()
@@ -1183,8 +1303,40 @@ class CloudSession:
                 depacketizer.skipped,
             )
 
+    def _packet_cadence(self, payload_type: int | None, *, audio: bool = True) -> str:
+        """The interval measured between a type's packets, and the rate it implies. Empty when
+        the session is too short to say anything.
+
+        A cross-check, never a decision: the sample rate is not in the payload at all, so the
+        one this session uses comes from the family's SDP convention, and this is the reading
+        that confirms or contradicts it -- in the log, where it can be compared, rather than in
+        a comment nobody can check. Per packet, which for `AAC-hbr` is per Access Unit (the mode
+        puts one in each), so a camera that bundled several would skew it.
+
+        `audio=False` for a payload type that is only known to have carried media: 40 ms between
+        packets is an ordinary second video stream and a nonsense sample rate for one, and the
+        plausibility guard below cannot tell those apart -- it tests the interval, not the kind
+        of stream it came from. That caller gets the interval and no reading of it.
+        """
+        span = self._media.get(payload_type)
+        if span is None or span.packets < _CADENCE_MIN_PACKETS or span.last <= span.first:
+            return ""
+        per_packet = (span.last - span.first) / (span.packets - 1)
+        interval = (
+            f", {span.packets} packet(s) over {span.last - span.first:.1f}s = "
+            f"{per_packet * 1000:.1f} ms each"
+        )
+        if not audio:
+            return interval
+        if not _AAC_FRAME_SECONDS[0] <= per_packet <= _AAC_FRAME_SECONDS[1]:
+            return ""
+        return f"{interval}, " + (
+            f"{_AAC_FRAME_SAMPLES / per_packet / 1000:.1f} kHz if a frame is "
+            f"{_AAC_FRAME_SAMPLES} samples"
+        )
+
     def _report_audio(
-        self, audio: AacHbrDepacketizer | None, video_payload_type: int | None
+        self, audio: AacHbrDepacketizer | None, plan: _PayloadPlan
     ) -> None:
         """Say what became of the camera's audio, including when nothing did.
 
@@ -1196,29 +1348,38 @@ class CloudSession:
         the one being served -- the case worth explaining is the one where the audio is never
         handed to FFmpeg at all.
 
-        The keys are guaranteed: a payload type reaches `_media_first` on the same packet that
-        the audio detection and the codec detection read, and neither reads a packet that
-        carries no media.
+        The config is printed with the provenance of its channel count, because that is the
+        only part of it the payload can answer: a session reading it from the camera's bytes
+        and one falling back to the family's default are the same four hex digits otherwise,
+        and the difference is exactly what somebody debugging a stereo camera needs to see.
         """
         others = {
-            payload_type: at
-            for payload_type, at in self._media_first.items()
-            if payload_type is not None and payload_type != video_payload_type
+            payload_type: span
+            for payload_type, span in self._media.items()
+            if payload_type is not None and payload_type != plan.payload_type
         }
-        video_at = self._media_first.get(video_payload_type, 0.0)
+        video = self._media.get(plan.payload_type)
+        video_at = video.first if video is not None else 0.0
         if audio is not None:
+            source = (
+                "channels read from the stream"
+                if plan.audio_channels is not None
+                else "channels from the family default"
+            )
             _LOGGER.info(
-                "[FFmpeg] %saudio: PT%s %s config=%#06x (%s), %d packet(s), %d AU(s), "
-                "%d unreadable, first media at +%.3fs (video at +%.3fs)",
+                "[FFmpeg] %saudio: PT%s %s config=%#06x (%s; %s), %d packet(s), %d AU(s), "
+                "%d unreadable%s, first media at +%.3fs (video at +%.3fs)",
                 self._label(),
                 audio.payload_type,
                 audio.codec,
                 audio.config,
                 describe_config(audio.config),
+                source,
                 audio.packets,
                 audio.aus,
                 audio.dropped,
-                self._media_first[audio.payload_type],
+                self._packet_cadence(audio.payload_type),
+                self._media[audio.payload_type].first,
                 video_at,
             )
             if self._audio_ended_at is not None:
@@ -1237,19 +1398,21 @@ class CloudSession:
                     audio.dropped,
                 )
             return
-        for payload_type, at in others.items():
+        for payload_type, span in others.items():
             _LOGGER.info(
-                "[FFmpeg] %spayload type PT%s carried media, first at +%.3fs (video at "
-                "+%.3fs), and was not served: %s",
+                "[FFmpeg] %spayload type PT%s carried media, first at +%.3fs, last at +%.3fs "
+                "(video at +%.3fs), and was not served: %s%s",
                 self._label(),
                 payload_type,
-                at,
+                span.first,
+                span.last,
                 video_at,
                 (
                     f"it started past the {self._audio_window:g}s audio window"
                     if self._audio_window > 0
                     else "the audio path is off (audio_window 0)"
                 ),
+                self._packet_cadence(payload_type, audio=False),
             )
         if not others and self._audio_window > 0 and self._ffmpeg_stderr:
             # Behind the diagnostic, unlike the two lines above: it is the shape of every RTP

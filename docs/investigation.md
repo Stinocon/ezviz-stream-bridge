@@ -526,9 +526,12 @@ Hikvision SDP names. The Access Unit is bare — no ADTS header — so the heade
 the `AudioSpecificConfig` the SDP would have carried (`0x1408`: AAC-LC, 16000 Hz, mono), and a
 second FFmpeg input reads the result. Two independent readings agree on the rate: the sizes and
 the 64 ms cadence (1024 samples at 16 kHz), and the SDP convention of the family. The channel
-count rests on the convention and on the bitrate alone — 228 bytes per 64 ms is about 28 kbit/s,
-where the same audio in stereo would be roughly twice that — so it is logged on every session
-that uses it rather than assumed quietly.
+count does not have to be inferred at all: an Access Unit is a `raw_data_block`, and its first
+three bits say whether it is a single channel element or a channel pair element. The bridge reads
+that, so the count comes from the stream rather than from the convention — 228 bytes per 64 ms is
+about 28 kbit/s, where the same audio in stereo would be roughly twice that, which is what the
+bitrate always did suggest. The one thing left to the convention is the sample rate, and the
+session logs the measured packet cadence beside it so the reading can be checked.
 
 The honest description of the result: **the video bytes come from the cloud, not the LAN.**
 What you gain is the camera in Home Assistant and Frigate without the EZVIZ app. What you do

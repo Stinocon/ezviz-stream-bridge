@@ -14,6 +14,7 @@ import pytest
 
 from ezviz_stream_bridge import rtp as rtp_module
 from ezviz_stream_bridge.rtp import (
+    AAC_LC_16K_MONO,
     H264,
     HEVC,
     AacHbrDepacketizer,
@@ -23,6 +24,8 @@ from ezviz_stream_bridge.rtp import (
     describe_config,
     detect_codec,
     parse_au_section,
+    set_channels,
+    stream_channels,
 )
 
 START_CODE = b"\x00\x00\x00\x01"
@@ -524,3 +527,34 @@ def test_describe_config_spells_out_the_family_default() -> None:
     assert describe_config(0x1210) == "AAC-LC, 44100 Hz, 2 channels"
     assert describe_config(0x1408) == describe_config()
     assert "reserved" in describe_config(0x1688)
+
+
+def test_the_element_id_is_what_says_mono_or_stereo() -> None:
+    """The one part of the audio configuration the payload can answer.
+
+    An Access Unit is a raw_data_block and opens with its element id: a single channel element
+    is one channel, a channel pair element is two. Measured on FFmpeg's own AAC encoder at both
+    settings -- 16 of 17 frames per stream, the other one being the primer fill element below.
+    """
+    assert stream_channels(bytes([0b000_00000]) + bytes(4)) == 1  # SCE
+    assert stream_channels(bytes([0b001_00000]) + bytes(4)) == 2  # CPE
+    assert stream_channels(bytes([0b110_00000]) + bytes(4)) is None  # FIL: no channel of its own
+    assert stream_channels(bytes([0b010_00000]) + bytes(4)) is None  # CCE: a coupling channel
+    assert stream_channels(b"") is None
+
+
+def test_set_channels_moves_only_the_channel_bits() -> None:
+    """The config is one field among several: the rate and the object type have to survive."""
+    stereo = set_channels(AAC_LC_16K_MONO, 2)
+
+    assert stereo == 0x1410
+    assert describe_config(stereo) == "AAC-LC, 16000 Hz, 2 channels"
+    assert set_channels(stereo, 1) == AAC_LC_16K_MONO
+
+
+def test_a_primer_fill_element_does_not_become_the_channel_count() -> None:
+    """FFmpeg's AAC encoder opens a stream with a fill element and nothing else, so a reading
+    taken from the first Access Unit alone would say "no channels" on an ordinary stereo
+    stream. The depacketizer is told the channels rather than reading them, so this is about
+    the reading itself being unavailable -- the session is what scans on."""
+    assert stream_channels(bytes([0b110_00000])) is None

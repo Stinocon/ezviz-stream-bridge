@@ -117,9 +117,10 @@ This project is the part that has to keep working for weeks unattended:
   RTP puts its sound there as well, under a second payload type — RFC 3640 MPEG4-GENERIC in
   `AAC-hbr` mode — and the bridge reads that as well as the video. It is the same problem twice:
   the payload carries no ADTS header, so one is rebuilt from the `AudioSpecificConfig` the
-  camera's own SDP would have carried (AAC-LC, 16 kHz, mono — logged on every session that
-  handles audio, so a camera that differs is visible), and FFmpeg is given a second input for
-  it. The session keeps reading its leading packets for up to `audio_window` seconds (2 by
+  camera's own SDP would have carried (AAC-LC, 16 kHz; the channel count is read from the Access
+  Units themselves, and every session that handles audio logs the config it used and whether the
+  count was read or fell back, so a camera that differs is visible), and FFmpeg is given a second
+  input for it. The session keeps reading its leading packets for up to `audio_window` seconds (2 by
   default) to find that payload before FFmpeg starts, because FFmpeg opens its inputs before it
   reads them and blocks forever on one that never delivers a frame; a camera whose audio starts
   with its video pays nothing, and `audio_window: 0` turns the audio path off. If the camera's
