@@ -113,22 +113,30 @@ This project is the part that has to keep working for weeks unattended:
   that has no container to carry a timestamp. An MPEG-PS stream is untouched: same
   demuxer, byte for byte. The price is up to eight packets of added latency on every
   session, because the decision has to happen before FFmpeg exists.
-- **Audio is depacketized too, when the camera sends it.** A camera that puts its video on
-  RTP puts its sound there as well, under a second payload type — RFC 3640 MPEG4-GENERIC in
-  `AAC-hbr` mode — and the bridge reads that as well as the video. It is the same problem twice:
-  the payload carries no ADTS header, so one is rebuilt from the `AudioSpecificConfig` the
-  camera's own SDP would have carried (AAC-LC, 16 kHz; the channel count is read from the Access
-  Units themselves, and every session that handles audio logs the config it used and whether the
-  count was read or fell back, so a camera that differs is visible), and FFmpeg is given a second
-  input for it. The session keeps reading its leading packets for up to `audio_window` seconds (2 by
-  default) to find that payload before FFmpeg starts, because FFmpeg opens its inputs before it
-  reads them and blocks forever on one that never delivers a frame; a camera whose audio starts
-  with its video pays nothing, and `audio_window: 0` turns the audio path off. If the camera's
-  audio then stops mid-session, its input is ended after five seconds of silence so the video
-  keeps flowing — FFmpeg stops muxing altogether on an input with no data in it — which leaves
-  that session without sound. Audio the sink cannot hand over is counted and warned about, rather
-  than lost quietly. An MPEG-PS session is not affected: it carries its own audio
-  inside the container and waits for nothing.
+- **Audio is depacketized too, when the camera sends it.** A camera that puts its video on RTP
+  puts its sound there as well, under a second payload type: RFC 3640 MPEG4-GENERIC in `AAC-hbr`
+  mode. It is the same problem twice. The payload carries no ADTS header, so one is rebuilt from
+  the `AudioSpecificConfig` the camera's own SDP would have carried, and FFmpeg is given a second
+  input for it.
+- **Of that configuration, one field is read and one is assumed, and the session says which.**
+  The sample rate is not in the payload at all, so it comes from the family's SDP convention
+  (AAC-LC, 16 kHz). The channel count is: an Access Unit opens with an element id that names one
+  channel or a pair of them, so the session reads it and says whether it read it or fell back to
+  the default. It also reports how many payloads it could not read at all, and the interval
+  measured between the packets beside the sample rate that interval implies, which is the only
+  cross-check the rate can have. A camera that differs is visible in the log rather than audible
+  on the speaker.
+- **It costs a short read-ahead, and it is paid only by cameras that have no audio.** FFmpeg has
+  to be told about that second input before it starts, because an input it opens and never gets a
+  frame from blocks it for good, so the session keeps reading its leading packets for up to
+  `audio_window` seconds (2 by default) looking for the audio. A camera whose audio starts with
+  its video pays nothing for that; one that never sends audio pays the two seconds, once per
+  session. `audio_window: 0` turns the audio path off and serves video only. If the camera's audio
+  then stops mid-session, that input is ended after five seconds of silence so the video keeps
+  flowing, because FFmpeg stops muxing altogether on an input with no data in it. From there the
+  session has no sound, and audio the sink could not hand over is counted and warned about rather
+  than lost quietly. An MPEG-PS session is unaffected: it carries its own audio inside the
+  container and waits for nothing.
 - **A stream that produces nothing now says which of the two it is.** A payload that is
   RTP with no H.264 or HEVC parameter set to name it, and packets the depacketizer cannot
   read, are counted and logged rather than left as a bare `bytes=0`. One RTP session can
@@ -227,13 +235,13 @@ pytest
 ruff check .
 ```
 
-The RTP path is verified against the FFmpeg the add-on actually runs, not the one on a
-development machine — the image installs Debian's, and a remux that worked on a laptop has
-failed inside the container before. The script builds synthetic H.264, HEVC and AAC streams,
-packetizes them the way RFC 6184, RFC 7798 and RFC 3640 say a camera does, runs them through
-the real session — its prefix read, its plan, its argv, both its pipes — and checks what comes
-out: the ADTS rebuilt from the AAC Access Units has to be the ADTS FFmpeg wrote byte for byte,
-and the MPEG-TS has to carry streams that decode.
+The RTP path is verified against the FFmpeg the add-on actually runs, not the one on a development
+machine: the image installs Debian's, and a remux that worked on a laptop has failed inside the
+container before. The script builds synthetic H.264, HEVC and AAC streams, packetizes them the way
+RFC 6184, RFC 7798 and RFC 3640 say a camera does, runs them through the real session (its prefix
+read, its plan, its argv, both its pipes), and checks what comes out. The ADTS rebuilt from the AAC
+Access Units has to be the ADTS FFmpeg wrote, byte for byte, and the MPEG-TS has to carry streams
+that decode.
 
 ```bash
 tools/verify_rtp_against_addon.sh
