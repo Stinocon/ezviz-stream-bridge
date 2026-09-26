@@ -183,7 +183,10 @@ def test_wait_for_cooldown_returns_when_the_consumer_has_gone() -> None:
     server.server_close()
 
 
-def _audio_window_args(tmp_path: Path, value: str) -> list[str]:
+DURATION_FLAGS = ("--first-video-timeout", "--timeout-cooldown", "--audio-window")
+
+
+def _duration_args(tmp_path: Path, flag: str, value: str) -> list[str]:
     return [
         "--serial",
         "BB1234567",
@@ -193,25 +196,35 @@ def _audio_window_args(tmp_path: Path, value: str) -> list[str]:
         str(tmp_path / "ezviz_token.json"),
         "--region",
         "apiieu.ezvizlife.com",
-        "--audio-window",
+        flag,
         value,
     ]
 
 
+@pytest.mark.parametrize("flag", DURATION_FLAGS)
 @pytest.mark.parametrize("value", ["nan", "inf", "-1", "2s"])
-def test_a_bad_audio_window_is_refused_at_the_command_line(
-    tmp_path: Path, value: str
+def test_a_duration_the_bridge_cannot_use_is_refused_at_the_command_line(
+    tmp_path: Path, flag: str, value: str
 ) -> None:
-    """The add-on options refuse these, and the command line has to agree: the same number
-    getting two verdicts depending on the door is how `nan` -- which disarms every comparison
-    it is used in, including the deadline it sets -- reaches a session. The add-on passes this
-    option as a flag, so that is the door that actually gets used."""
+    """All three durations, not only the one the audio feature added.
+
+    They are the same defect at the same three doors: `float()` accepts `nan` and `inf`, and every
+    comparison against them is false afterwards, so a no-video budget set to `nan` never fires and
+    a cooldown set to `inf` never ends. A fix with no test is a claim, which is how the two older
+    flags kept the defect for a release after the third one lost it.
+    """
     with pytest.raises(SystemExit):
-        _parse_args(_audio_window_args(tmp_path, value))
+        _parse_args(_duration_args(tmp_path, flag, value))
 
 
+@pytest.mark.parametrize("flag", DURATION_FLAGS)
 @pytest.mark.parametrize("value", ["0", "1.5", "0.25"])
-def test_a_good_audio_window_survives_the_command_line(tmp_path: Path, value: str) -> None:
-    args = _parse_args(_audio_window_args(tmp_path, value))
+def test_a_usable_duration_survives_the_command_line(
+    tmp_path: Path, flag: str, value: str
+) -> None:
+    args = _parse_args(_duration_args(tmp_path, flag, value))
 
-    assert args.audio_window == float(value)
+    # `0` is not a mistake at any of the three: it is how each one is disabled.
+    assert getattr(args, flag.lstrip("-").replace("-", "_")) == float(value)
+
+
