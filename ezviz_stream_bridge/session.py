@@ -28,6 +28,7 @@ import socket
 import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, replace
@@ -80,9 +81,17 @@ DEFAULT_AUDIO_WINDOW = 2.0
 # what normally ends the wait, so this only has to be a bound and not a second window.
 _AUDIO_WINDOW_BYTES = 4 * 1024 * 1024
 
+# How much audio the pipe has not taken yet. A pipe holds 64 KiB, and FFmpeg can leave the audio
+# unread for as long as it is waiting for video -- so without a bound of its own this buffer is the
+# only thing standing between a slow consumer and an unbounded one. A minute of this family's
+# audio is about 200 KiB.
+_AUDIO_PENDING_BYTES = 256 * 1024
+
 # Fewer packets than this and an interval says nothing: it would be one measurement with no way
-# to tell a real cadence from the gap before the camera started talking.
+# to tell a real cadence from the gap before the camera started talking. The same is true of a
+# span this short -- packets handed over in one burst have an interval, but it is not a cadence.
 _CADENCE_MIN_PACKETS = 2
+_CADENCE_MIN_SECONDS = 0.001
 
 # An AAC-LC frame is 1024 samples, and the sampling frequencies the format defines run from
 # 7350 Hz to 96 kHz -- so a frame lasts between 10.7 and 139 ms. A span outside that is not a
@@ -286,6 +295,26 @@ def _audio_channels(payload_type: int | None, packets: tuple[bytes, ...]) -> int
     return None
 
 
+def _why_not_served(
+    audio_window: float, window_closed_at: float | None, first_at: float
+) -> str:
+    """When a payload type that carried media was there, relative to the session's audio window.
+
+    Two facts, and no cause. Comparing against the *configured* window instead of the one the
+    session actually ran is what made the first version of this line blame the window for a payload
+    that started inside it: the window opens after the VTM handshake and the prefix read, so on a
+    slow handshake it is still open well past `audio_window` seconds into the session. The only
+    thing that can be said without measuring anything else is whether the media arrived before or
+    after the moment the session stopped looking -- and that is enough, because it is what decides
+    whether raising the window is the fix or a number changed for nothing.
+    """
+    if audio_window <= 0 or window_closed_at is None:
+        return "the audio path is off (audio_window 0)"
+    if first_at > window_closed_at:
+        return f"it started after the {audio_window:g}s audio window closed"
+    return f"it started before the {audio_window:g}s audio window closed"
+
+
 def _audio_config(plan: _PayloadPlan) -> int:
     """The AudioSpecificConfig for a session: the family's, with what the camera said about it.
 
@@ -326,6 +355,94 @@ def _carries_media(body: bytes) -> bool:
     return True
 
 
+class _AudioPipe:
+    """The write end of the pipe FFmpeg reads the audio from -- and never a place to park.
+
+    A blocking write here is a deadlock with no way out of it. FFmpeg opens its inputs in order
+    and probes the video one before it opens the audio input at all, so a thread parked in
+    `write` on a full audio pipe is parked while FFmpeg waits for video that the same thread has
+    not written yet -- and no watchdog can help, because closing a file does not wake a thread
+    that is already inside `write`. The descriptor is therefore non-blocking, and what it will not
+    take is kept here and offered again on every later packet, video included: FFmpeg always
+    reaches the audio pipe once it has the video its probe wants, and then it drains this.
+
+    Whole chunks rather than bytes, and bounded. A chunk is one packet's Access Units, so dropping
+    the oldest when the bound is reached loses frames instead of corrupting the framing. `dropped`
+    counts every audio byte that never reached FFmpeg -- the chunks the bound threw away, and
+    whatever was still queued when the session ended or FFmpeg died -- and the session reports it:
+    a camera that outruns FFmpeg for longer than the bound gets gaps it can be told about, which is
+    a number rather than a session that quietly loses sound.
+    """
+
+    def __init__(self, fd: int) -> None:
+        os.set_blocking(fd, False)
+        self._fd = fd
+        # Held only around non-blocking operations, so it cannot park anybody: it is here so that
+        # a close from the stall watchdog cannot land between a write's check and its syscall,
+        # where the descriptor could already have been recycled by another thread.
+        self._lock = threading.Lock()
+        self._pending: deque[bytes] = deque()
+        self._pending_bytes = 0
+        self.dropped = 0
+        self._closed = False
+
+    def write(self, frames: bytes) -> None:
+        """Offer audio bytes to the pipe, keeping what it will not take."""
+        with self._lock:
+            if self._closed:
+                return
+            self._pending.append(frames)
+            self._pending_bytes += len(frames)
+            while self._pending_bytes > _AUDIO_PENDING_BYTES and len(self._pending) > 1:
+                self.dropped += len(self._pending.popleft())
+                self._pending_bytes = sum(len(chunk) for chunk in self._pending)
+            self._drain()
+
+    def flush(self) -> None:
+        """Try the pipe again with whatever is waiting for room."""
+        with self._lock:
+            self._drain()
+
+    def close(self) -> None:
+        """Release the descriptor, once. Later writes find it closed and do nothing."""
+        with self._lock:
+            if self._closed:
+                return
+            # Set before the syscall: the flag is what keeps a recycled descriptor number from
+            # ever being written to by a write that lost the race.
+            self._closed = True
+            with suppress(OSError):
+                os.close(self._fd)
+            # Counted as well, not just discarded: these bytes never reached FFmpeg either, and a
+            # number that means "the bound threw some away" while silently dropping the tail would
+            # undercount exactly the case it exists for.
+            self.dropped += self._pending_bytes
+            self._pending.clear()
+            self._pending_bytes = 0
+
+    def _drain(self) -> None:
+        """Write what fits, oldest first, and keep the rest. Called with the lock held."""
+        if self._closed:
+            return
+        while self._pending:
+            try:
+                written = os.write(self._fd, self._pending[0])
+            except BlockingIOError:
+                return
+            except OSError:
+                # The reader is gone: FFmpeg is dead and the teardown is on its way. What is left
+                # never made it out, and it belongs in the same count as the rest.
+                self.dropped += self._pending_bytes
+                self._pending.clear()
+                self._pending_bytes = 0
+                return
+            self._pending_bytes -= written
+            if written < len(self._pending[0]):
+                self._pending[0] = self._pending[0][written:]
+                return
+            self._pending.popleft()
+
+
 @dataclass
 class _MediaSpan:
     """What one payload type's media looked like in time: first, last, and how many packets.
@@ -358,7 +475,7 @@ class _Sinks:
 
     video: BinaryIO
     depacketizer: RtpDepacketizer | None
-    audio: BinaryIO | None = None
+    audio: _AudioPipe | None = None
     audio_depacketizer: AacHbrDepacketizer | None = None
     now: Callable[[], float] = time.monotonic
     audio_at: float = 0.0  # when audio was last written, for the stall check
@@ -389,19 +506,17 @@ class _Sinks:
             # attribute here would be the one thing this path cannot afford: an AttributeError
             # on `None` is not an OSError, so it would escape the guard below, reach the pump's
             # `except Exception` and take the whole session down -- video included -- at exactly
-            # the moment the watchdog was saving it. A bound reference to an already-closed file
-            # raises ValueError instead, which is handled.
+            # the moment the watchdog was saving it. A bound reference to a pipe that is already
+            # closed does nothing instead.
             pipe = self.audio
             if frames and pipe is not None:
-                try:
-                    pipe.write(frames)
-                    pipe.flush()
-                except (OSError, ValueError):
-                    # Given up between the bind and here. The frames are lost -- the session has
-                    # already decided it has no audio -- and the video is what must not be.
-                    return
+                pipe.write(frames)
                 self.audio_at = self.now()
             return
+        # A video packet is also the moment to try the audio pipe again: one comparison when
+        # nothing is waiting, and it is what lets the audio sink do without a thread of its own.
+        if self.audio is not None:
+            self.audio.flush()
         chunk = self.depacketizer.feed(body) if self.depacketizer is not None else body
         if chunk:
             self.video.write(chunk)
@@ -411,16 +526,15 @@ class _Sinks:
         """Release the audio input, once. False when there is nothing left to give up.
 
         Called from the watchdog thread while the pump may be writing, so the reference is
-        dropped before the descriptor is closed: the pump then loses frames rather than the
-        session. Dropping it first is also what keeps `feed` from writing through a reference
-        that is already closed, and closing the file object rather than the descriptor means a
-        later write cannot land on a recycled descriptor number -- the object knows it is shut.
+        dropped before the pipe is closed: the pump then loses frames rather than the session.
+        Dropping it first is also what keeps `feed` from writing through a reference that is
+        already closed, and the pipe closes the descriptor itself rather than the descriptor
+        number being reused while a write still holds it.
         """
         target, self.audio = self.audio, None
         if target is None:
             return False
-        with suppress(OSError, ValueError):
-            target.close()
+        target.close()
         return True
 
 
@@ -519,7 +633,14 @@ class CloudSession:
         self._abort_reason: str | None = None
         self._socket: socket.socket | None = None
         self._ffmpeg: subprocess.Popen[bytes] | None = None
-        self._audio_stdin: BinaryIO | None = None
+        self._audio_pipe: _AudioPipe | None = None
+        # Audio bytes that never reached FFmpeg, kept here because the pipe is released before the
+        # session reports and its own counter would go with it.
+        self._audio_lost = 0
+        # Where the session stopped looking for the audio, session-relative, or None when the
+        # audio path is off. This is what makes "it started past the window" a measured claim
+        # instead of an inference from the configured number.
+        self._window_closed_at: float | None = None
         # Seconds into the session at which the audio input was given up as stalled, or None.
         self._audio_ended_at: float | None = None
         self._writer_error: Exception | None = None
@@ -747,7 +868,7 @@ class CloudSession:
             # The child holds its own copy of the read end now; keeping ours would mean an
             # input FFmpeg never sees the end of.
             os.close(audio_read)
-            self._audio_stdin = os.fdopen(audio_write, "wb")
+            self._audio_pipe = _AudioPipe(audio_write)
         return process
 
     def _launch_remux(
@@ -902,15 +1023,20 @@ class CloudSession:
             else None
         )
         if channels is not None:
-            # Both questions answered by the prefix, which is the common case and costs nothing:
+            # The prefix answered both questions, which is the common case and costs nothing:
+            # there is no window to open, and it is closed as soon as this returns. Recorded
+            # rather than assumed, so a payload type that came later can be told which side of
+            # this moment it fell on.
             # a camera that starts its audio with its video puts it inside the eight packets the
             # demuxer is chosen from. Note that both have to be answered -- finding the audio and
             # knowing its channel count are different questions, and returning on the first one
             # would lock in the family's default for a session whose second Access Unit says
             # otherwise.
+            self._window_closed_at = self._now() - self._started
             return replace(
                 plan, audio_payload_type=audio_payload_type, audio_channels=channels
             )
+        self._window_closed_at = self._now() - self._started + self._audio_window
         deadline = self._now() + self._audio_window
         extra: list[bytes] = []
         buffered = 0
@@ -1106,7 +1232,7 @@ class CloudSession:
         sinks = _Sinks(
             video=stdin,
             depacketizer=depacketizer,
-            audio=self._audio_stdin,
+            audio=self._audio_pipe,
             audio_depacketizer=audio_depacketizer,
             now=self._now,
         )
@@ -1149,12 +1275,14 @@ class CloudSession:
             stall_stop.set()
             if stall_watchdog is not None:
                 stall_watchdog.join(timeout=_AUDIO_STALL_POLL + _WRITER_JOIN_TIMEOUT)
+            # Before the report, and the order is the point: releasing the pipe is what turns the
+            # audio still queued in it into a counted loss, and the report is where the count is
+            # read. FFmpeg gets its EOF here rather than a few lines below, which is where it was
+            # always going to come from anyway.
+            self._close_audio()
             if depacketizer is not None:
                 self._finish_depacketizer(depacketizer)
                 self._report_audio(audio_depacketizer, plan)
-            # Order matters only for tidiness: FFmpeg is already gone, and a write end left
-            # open would keep its reader from seeing EOF.
-            self._close_audio()
             # EOF for FFmpeg, which is what ends a session that stopped on its own.
             with suppress(OSError):
                 stdin.close()
@@ -1319,7 +1447,11 @@ class CloudSession:
         of stream it came from. That caller gets the interval and no reading of it.
         """
         span = self._media.get(payload_type)
-        if span is None or span.packets < _CADENCE_MIN_PACKETS or span.last <= span.first:
+        if (
+            span is None
+            or span.packets < _CADENCE_MIN_PACKETS
+            or span.last - span.first < _CADENCE_MIN_SECONDS
+        ):
             return ""
         per_packet = (span.last - span.first) / (span.packets - 1)
         interval = (
@@ -1389,6 +1521,13 @@ class CloudSession:
                     self._label(),
                     self._audio_ended_at,
                 )
+            if self._audio_lost:
+                _LOGGER.warning(
+                    "[FFmpeg] %s%d byte(s) of the camera's audio never reached FFmpeg: the "
+                    "session could not hand over everything it was given",
+                    self._label(),
+                    self._audio_lost,
+                )
             if audio.dropped:
                 _LOGGER.warning(
                     "[FFmpeg] %sthe %s depacketizer dropped %d packet(s): the camera's audio "
@@ -1407,11 +1546,7 @@ class CloudSession:
                 span.first,
                 span.last,
                 video_at,
-                (
-                    f"it started past the {self._audio_window:g}s audio window"
-                    if self._audio_window > 0
-                    else "the audio path is off (audio_window 0)"
-                ),
+                _why_not_served(self._audio_window, self._window_closed_at, span.first),
                 self._packet_cadence(payload_type, audio=False),
             )
         if not others and self._audio_window > 0 and self._ffmpeg_stderr:
@@ -1429,10 +1564,12 @@ class CloudSession:
     def _close_audio(self) -> None:
         """Release the audio pipe, once, whichever path is tearing the session down."""
         with self._lock:
-            pipe, self._audio_stdin = self._audio_stdin, None
+            pipe, self._audio_pipe = self._audio_pipe, None
         if pipe is not None:
-            with suppress(OSError):
-                pipe.close()
+            # Idempotent: the stall watchdog may have closed it already. The first close is the one
+            # that counts the tail still queued, which is why the count is read after it.
+            pipe.close()
+            self._audio_lost = pipe.dropped
 
     def _pump_ffmpeg_to_consumer(self, ffmpeg: subprocess.Popen[bytes], output: BinaryIO) -> None:
         """FFmpeg stdout -> the consumer, until EOF or the session is cancelled.

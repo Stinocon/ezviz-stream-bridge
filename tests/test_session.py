@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import socket
 import threading
 import time
@@ -1419,9 +1420,9 @@ def test_ffmpeg_is_given_a_second_input_reading_adts(tmp_path: Path) -> None:
     assert args[audio_at - 1] == "-f"
     assert args[audio_at + 1] == "-i"
     assert int(args[audio_at + 2].split(":")[1]) > 2, "a descriptor of our own, not a standard one"
-    assert session._audio_stdin is not None
+    assert session._audio_pipe is not None
     session._close_audio()
-    assert session._audio_stdin is None, "the write end is released by the teardown"
+    assert session._audio_pipe is None, "the write end is released by the teardown"
 
 
 def test_the_camera_audio_reaches_ffmpeg_as_adts(vtm, two_input_ffmpeg, caplog) -> None:
@@ -1510,7 +1511,7 @@ def test_audio_that_starts_past_the_window_is_measured_not_guessed(
     assert audio_file.read_bytes() == b"", "the audio was never handed to FFmpeg"
     line = next(line for line in _diagnostic_lines(caplog) if "carried media, first at" in line)
     assert "PT104" in line
-    assert "started past the 0.05s audio window" in line
+    assert "started after the 0.05s audio window closed" in line
 
 
 def test_a_zero_audio_window_reads_no_further() -> None:
@@ -1914,3 +1915,154 @@ def test_a_second_video_stream_is_not_reported_as_a_sample_rate() -> None:
     assert "40.0 ms each" in measured
     assert "kHz" not in measured, "nothing there says these are AAC frames"
     assert "kHz" in session._packet_cadence(113), "on the real audio stream the reading is made"
+
+
+def bulk_audio_packet(units: int = 2, unit_bytes: int = 8180) -> bytes:
+    """An audio packet carrying the largest Access Units the AU header can describe.
+
+    Two of them, so one packet is ~16 KiB of ADTS: seven of these are more than a pipe holds,
+    which is the shape that parks a writer on the audio pipe.
+    """
+    section = (units * 16).to_bytes(2, "big") + b"".join(
+        ((unit_bytes << 3) | index).to_bytes(2, "big") for index in range(units)
+    )
+    body = b"".join(bytes([0b001_00000]) + bytes(unit_bytes - 1) for _ in range(units))
+    return rtp_packet(section + body, payload_type=104)
+
+
+@pytest.fixture
+def video_first_ffmpeg(tmp_path: Path) -> tuple[str, Path, Path]:
+    """A remux that reads the video pipe before the audio one, the way FFmpeg does.
+
+    FFmpeg opens its inputs in order and probes the video input before it opens the audio one at
+    all, so this is the order that matters: a session that offers the whole audio buffer first,
+    blocking, parks against a reader that is waiting for video, and neither ever moves.
+    """
+    script = tmp_path / "video-first-ffmpeg"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "extra = [\n"
+        "    int(arg.split(':')[1])\n"
+        "    for arg in sys.argv[1:]\n"
+        "    if arg.startswith('pipe:') and arg not in ('pipe:0', 'pipe:1')\n"
+        "]\n"
+        "# The video probe: read it before touching the audio descriptor.\n"
+        "video = sys.stdin.buffer.read(65536)\n"
+        "audio = b''\n"
+        "for fd in extra:\n"
+        "    while True:\n"
+        "        chunk = os.read(fd, 65536)\n"
+        "        if not chunk:\n"
+        "            break\n"
+        "        audio += chunk\n"
+        "video += sys.stdin.buffer.read()\n"
+        "for suffix, payload in (('.video', video), ('.audio', audio)):\n"
+        "    with open(sys.argv[0] + suffix, 'wb') as handle:\n"
+        "        handle.write(payload)\n"
+    )
+    script.chmod(0o755)
+    return str(script), Path(f"{script}.video"), Path(f"{script}.audio")
+
+
+def test_a_large_audio_buffer_cannot_park_the_session(
+    vtm, video_first_ffmpeg, caplog
+) -> None:
+    """The deadlock the audio-first order could cause, pinned.
+
+    FFmpeg opens the video input first and probes it before it opens the audio one, so a session
+    that writes its whole audio buffer before any video parks in `write` against a reader waiting
+    for video -- and closing that pipe from the watchdog does not wake a thread already inside
+    `write`. Seven 16 KiB audio packets fill a 64 KiB pipe on their own, which is what this feeds:
+    the session has to get its video out regardless, and finish.
+    """
+    caplog.set_level(logging.INFO)
+    ffmpeg_path, video_file, audio_file = video_first_ffmpeg
+    packets = [video(rtp_packet(SPS_PAYLOAD, payload_type=96))]
+    packets += [video(bulk_audio_packet()) for _ in range(7)]
+    vtm(packets, silent_after=False)
+    session = CloudSession(object(), "BB1234567", ffmpeg_path=ffmpeg_path, first_video_timeout=0)
+
+    started = time.monotonic()
+    thread, errors = run_in_thread(session, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+    elapsed = time.monotonic() - started
+
+    assert not thread.is_alive(), "the session parked: the audio pipe held a reader that waited"
+    assert errors == []
+    assert elapsed < TEARDOWN_LIMIT
+    assert video_file.read_bytes() == START_CODE + SPS_PAYLOAD, "the video still reached FFmpeg"
+    # Conserved, not merely positive: what FFmpeg took plus what never got out has to be every
+    # byte the depacketizer produced. "Some audio arrived" would pass on half of it, which is the
+    # blind spot the session's own count exists to remove.
+    produced = 7 * 2 * (7 + 8180)
+    assert len(audio_file.read_bytes()) + session._audio_lost == produced
+    # And the count has to be *said*, which is what the decision record claims of it: a bare
+    # counter nobody prints is the defect this assertion was written after.
+    assert any(
+        "never reached FFmpeg" in line for line in _diagnostic_lines(caplog)
+    ), "the audio that never got out was not reported"
+
+
+def test_the_audio_pipe_never_parks_and_keeps_what_it_cannot_write() -> None:
+    """Nobody reading, 300 KiB offered: every call returns, and nothing is lost unaccounted for.
+
+    The bound is what makes that true of a long session too: past it the OLDEST whole chunks go,
+    which is a gap in the audio rather than a corrupted frame, and the count is reported.
+    """
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(read_fd, False)
+    pipe = session_module._AudioPipe(write_fd)
+    # More than the pipe (64 KiB) and the pending bound together, so the bound has to be reached.
+    offered = 400 * 1024
+    try:
+        for _ in range(400):
+            pipe.write(bytes(1024))  # returns every time: that is the whole point
+        assert pipe.dropped > 0, "the pending bound was never reached with nobody reading"
+
+        taken = 0
+        for _ in range(20):  # alternate: what the pipe frees, the pipe tries again
+            try:
+                while True:
+                    chunk = os.read(read_fd, 65536)
+                    if not chunk:
+                        break
+                    taken += len(chunk)
+            except BlockingIOError:
+                pass
+            pipe.flush()
+        assert taken + pipe.dropped == offered, "bytes went missing without being accounted for"
+        assert taken > 0, "the pipe never took anything"
+    finally:
+        pipe.close()
+        os.close(read_fd)
+
+
+def test_an_unserved_payload_type_inside_the_window_is_not_blamed_on_the_window(
+    vtm, fake_ffmpeg, caplog
+) -> None:
+    """The one line whose purpose is to be corrected from says only what was measured.
+
+    A second payload type that starts inside the window and is not AAC-hbr was not dropped for
+    want of a longer window, and telling an operator to raise `audio_window` sends them to change
+    a number that was never the cause.
+    """
+    caplog.set_level(logging.INFO)
+    not_audio = b"\xff\xf1\x50\x80\x00"  # ADTS-shaped bytes, not an AU header section
+    packets = [video(rtp_packet(SPS_PAYLOAD, payload_type=96))]
+    packets += [video(rtp_packet(not_audio, payload_type=8)) for _ in range(3)]
+    vtm(packets, silent_after=False)
+    session = CloudSession(
+        object(), "BB1234567", ffmpeg_path=fake_ffmpeg, first_video_timeout=0
+    )
+
+    thread, errors = run_in_thread(session, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert not thread.is_alive()
+    assert errors == []
+    line = next(line for line in _diagnostic_lines(caplog) if "was not served" in line)
+    assert "started before the 2s audio window closed" in line, line
+    assert "after the" not in line, "a window that was still open is not the cause"

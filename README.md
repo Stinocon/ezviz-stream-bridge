@@ -126,7 +126,8 @@ This project is the part that has to keep working for weeks unattended:
   with its video pays nothing, and `audio_window: 0` turns the audio path off. If the camera's
   audio then stops mid-session, its input is ended after five seconds of silence so the video
   keeps flowing — FFmpeg stops muxing altogether on an input with no data in it — which leaves
-  that session without sound. An MPEG-PS session is not affected: it carries its own audio
+  that session without sound. Audio the sink cannot hand over is counted and warned about, rather
+  than lost quietly. An MPEG-PS session is not affected: it carries its own audio
   inside the container and waits for nothing.
 - **A stream that produces nothing now says which of the two it is.** A payload that is
   RTP with no H.264 or HEVC parameter set to name it, and packets the depacketizer cannot
