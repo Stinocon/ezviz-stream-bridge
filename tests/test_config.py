@@ -136,3 +136,27 @@ def test_round_trip_through_a_file(tmp_path) -> None:
     config = BridgeConfig.from_options(load_options(path))
 
     assert config.region == "apius.ezvizlife.com"
+
+
+def test_the_audio_window_is_unset_by_default() -> None:
+    # None and not a number: the proxy owns the default, and an add-on that passes nothing has
+    # to leave it owning it, or the number would live in two places.
+    assert BridgeConfig.from_options(_options()).audio_window is None
+
+
+@pytest.mark.parametrize("value", [1.5, "2.5", 0])
+def test_the_audio_window_is_read_when_set(value: object) -> None:
+    config = BridgeConfig.from_options(_options(audio_window=value))
+
+    assert config.audio_window == float(value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", ["", None, "  "])
+def test_an_empty_audio_window_means_unset(value: object) -> None:
+    assert BridgeConfig.from_options(_options(audio_window=value)).audio_window is None
+
+
+@pytest.mark.parametrize("value", [-1, "not a number", "2s", "nan", "inf"])
+def test_a_bad_audio_window_names_the_option(value: object) -> None:
+    with pytest.raises(ConfigError, match="audio_window"):
+        BridgeConfig.from_options(_options(audio_window=value))

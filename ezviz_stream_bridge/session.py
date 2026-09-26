@@ -22,6 +22,7 @@ only one that joins, closes and reaps.
 from __future__ import annotations
 
 import logging
+import os
 import select
 import socket
 import subprocess
@@ -29,14 +30,14 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, BinaryIO
 
 from pyezvizapi.cloud_stream import open_cloud_stream
 from pyezvizapi.exceptions import PyEzvizError
 from pyezvizapi.stream import VtmChannel, rtp_payload
 
-from .rtp import RtpDepacketizer, detect_codec
+from .rtp import AacHbrDepacketizer, RtpDepacketizer, carries_aac_hbr, describe_config, detect_codec
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -52,6 +53,39 @@ VTM_SOCKET_TIMEOUT = 10.0
 # (hardcoded in v1.9.10), so staying under that guarantees the cloud session is released
 # while our consumer is still there to notice, rather than being left behind.
 DEFAULT_FIRST_VIDEO_TIMEOUT = 25.0
+
+# Seconds to keep reading the leading packets after the video codec was named, in case the
+# camera sends its audio under a second payload type. It is the price of the second FFmpeg
+# input: FFmpeg opens its inputs before it reads them and blocks on one that has no frame yet,
+# so whether there is audio to serve has to be known before FFmpeg is started. A camera that
+# sends audio pays only until its first audio payload arrives, which at 64 ms a frame is a
+# fraction of a second; a camera that sends none pays the whole window, once per session.
+# Zero disables the audio path and the wait with it.
+DEFAULT_AUDIO_WINDOW = 2.0
+
+# The audio window's memory bound. The deadline is enough for the case the window is for -- a
+# camera streaming as usual -- and this is what keeps a camera that is not doing that from
+# turning the wait into an unbounded buffer of packets that are only held in order to be
+# replayed. It is generous on purpose: the packets are 4 KiB in practice and the deadline is
+# what normally ends the wait, so this only has to be a bound and not a second window.
+_AUDIO_WINDOW_BYTES = 4 * 1024 * 1024
+
+# Seconds of audio silence after which the audio input is ended, so the video keeps flowing.
+# FFmpeg reads a packet from every input before it muxes any, and the demuxer thread for an
+# input with nothing in it blocks in `read`: the muxer then waits for that stream, the video
+# pipe fills, and the session stops producing altogether while the camera keeps streaming --
+# measured, not inferred (a stack sample of a stalled FFmpeg sits in `read` on the audio
+# descriptor, and closing the write end frees the video a few seconds later). The threshold is
+# long because the price is the rest of the session's audio: at a frame every 64 ms, five
+# seconds of silence is a stream that has stopped, not one that paused.
+_AUDIO_STALL_SECONDS = 5.0
+
+# How often the watchdog above looks at the clock. It is a thread rather than a check in the
+# pump's loop because the pump is blocked in `stdin.write` by then: FFmpeg stops reading the
+# video pipe as soon as its demuxer thread blocks on the audio, and the pipe holds less than a
+# second of a 1080p stream -- measured, 1 Mbit/s of video stopped the writer 1.6 s after the
+# audio stopped, so a check that only ran between packets would never run.
+_AUDIO_STALL_POLL = 0.5
 
 # FFmpeg -> consumer chunk size, matching the library's copy loop.
 _READ_SIZE = 65536
@@ -104,6 +138,11 @@ _PAYLOAD_TYPE_REPORT_MAX = 6
 # The demuxer FFmpeg reads MPEG-PS with. Anything else here is an elementary stream the
 # session has already depacketized, and the name is the codec.
 _MPEG_PS_DEMUXER = "mpeg"
+
+# The demuxer FFmpeg reads ADTS with, which is the framing the audio path rebuilds out of an
+# RFC 3640 payload: the camera's audio arrives bare, and this is the only spelling of it that
+# FFmpeg has a demuxer for.
+_AAC_DEMUXER = "aac"
 
 # MPEG-PS pack_start_code. The byte after `00 00 01` is 0xBA, whose top bit is set -- the
 # forbidden_zero_bit of an H.264/H.265 NAL header -- so it cannot be a valid NAL, and a
@@ -166,6 +205,36 @@ def _codec_of(body: bytes) -> str | None:
         return None
 
 
+def _audio_payload(body: bytes) -> bool:
+    """True when a video packet's payload is audio this bridge can turn into ADTS.
+
+    The reading is self-validating rather than a payload type: the AU sizes have to account
+    for every byte of the payload exactly, which no other kind of packet does by accident. A
+    camera that stamps its audio with a different payload type, or renumbers it mid-session,
+    is therefore still recognised -- and one that sends a second kind of video under a payload
+    type of its own is not mistaken for a camera with audio.
+    """
+    try:
+        return carries_aac_hbr(rtp_payload(body))
+    except PyEzvizError:
+        return False
+
+
+def _prefix_audio(payload_type: int | None, packets: tuple[bytes, ...]) -> int | None:
+    """The audio payload type, when the video prefix already carried some.
+
+    Separate from the window because it is the common case and it costs nothing: a camera that
+    starts its audio with its video puts it inside the eight packets the demuxer is chosen
+    from, and there is then nothing to wait for. Only a camera that starts later makes the
+    session read on.
+    """
+    for body in packets:
+        candidate = _payload_type_of(body)
+        if candidate != payload_type and _audio_payload(body):
+            return candidate
+    return None
+
+
 def _payload_type_of(body: bytes) -> int | None:
     """The RTP payload type of a packet body, or None when it is not an RTP header."""
     if len(body) < _RTP_HEADER_BYTES or (body[0] & _RTP_VERSION_MASK) != _RTP_VERSION_2:
@@ -193,16 +262,78 @@ def _carries_media(body: bytes) -> bool:
     return True
 
 
-def _forward(
-    stdin: BinaryIO, depacketizer: RtpDepacketizer | None, body: bytes
-) -> None:
-    """Write one video packet to FFmpeg, depacketizing it when the payload is RTP."""
-    if not body:
-        return
-    chunk = depacketizer.feed(body) if depacketizer is not None else body
-    if chunk:
-        stdin.write(chunk)
-        stdin.flush()
+@dataclass
+class _Sinks:
+    """Where one packet goes: FFmpeg's video pipe, and its audio pipe when there is one.
+
+    Routing lives here rather than at each of the two call sites -- the prefix replay and the
+    live loop -- because it is one decision taken from one fact, the packet's payload type,
+    and the two have to take it the same way. A packet of the audio payload type belongs to
+    the audio sink only when a depacketizer exists for it: with none, it falls through to the
+    video one, which counts it as another payload type and skips it, exactly as it did before
+    this path existed.
+
+    Not frozen, unlike the rest of this module's value objects: the audio input can be given up
+    mid-session (see `_end_stalled_audio`), and after that there is no audio sink to write to.
+    """
+
+    video: BinaryIO
+    depacketizer: RtpDepacketizer | None
+    audio: BinaryIO | None = None
+    audio_depacketizer: AacHbrDepacketizer | None = None
+    now: Callable[[], float] = time.monotonic
+    audio_at: float = 0.0  # when audio was last written, for the stall check
+
+    def __post_init__(self) -> None:
+        if self.audio is not None:
+            # The clock starts with the input, not at the epoch: a zero here would read as a
+            # stall that has not happened.
+            self.audio_at = self.now()
+
+    def owns_audio(self, body: bytes) -> bool:
+        """True when this packet is the audio stream's, rather than one to skip."""
+        return (
+            self.audio is not None
+            and self.audio_depacketizer is not None
+            and _payload_type_of(body) == self.audio_depacketizer.payload_type
+        )
+
+    def feed(self, body: bytes) -> None:
+        """Write one packet to the sink that owns it, and only when it produces bytes."""
+        if not body:
+            return
+        audio = self.audio_depacketizer
+        if audio is not None and self.owns_audio(body):
+            frames = audio.feed(body)
+            if frames:
+                try:
+                    self.audio.write(frames)
+                    self.audio.flush()
+                except (OSError, ValueError):
+                    # The watchdog gave the input up between the check above and here. Those
+                    # frames are lost -- the session has already decided it has no audio -- and
+                    # the video is what must not be.
+                    return
+                self.audio_at = self.now()
+            return
+        chunk = self.depacketizer.feed(body) if self.depacketizer is not None else body
+        if chunk:
+            self.video.write(chunk)
+            self.video.flush()
+
+    def give_up_audio(self) -> bool:
+        """Release the audio input, once. False when there is nothing left to give up.
+
+        Called from the watchdog thread while the pump may be writing, so the descriptor is
+        dropped before it is closed: the pump's own write then sees `None`, or raises, and
+        either way it is the frames that are lost and not the session.
+        """
+        target, self.audio = self.audio, None
+        if target is None:
+            return False
+        with suppress(OSError, ValueError):
+            target.close()
+        return True
 
 
 def _describe_rtp_header(body: bytes) -> str:
@@ -235,6 +366,11 @@ class _PayloadPlan:
     session depacketizes to Annex-B, so there is no RTP left for FFmpeg to read. `codec` and
     `payload_type` are None unless that depacketization is needed; the payload type is the one
     the codec was identified from, so nothing else on the same RTP session is mistaken for it.
+
+    `audio_payload_type` is filled in afterwards, by the audio window, and it is the one field
+    that cannot come from the video prefix: the camera's audio is a second payload type that
+    may not have started yet when the video codec is already known. When it is set, FFmpeg is
+    started with a second input, and `packets` includes what was read while waiting for it.
     """
 
     transport: str
@@ -242,6 +378,7 @@ class _PayloadPlan:
     codec: str | None
     payload_type: int | None
     packets: tuple[bytes, ...]
+    audio_payload_type: int | None = None
 
 
 @dataclass
@@ -265,6 +402,7 @@ class CloudSession:
         *,
         ffmpeg_path: str = "ffmpeg",
         first_video_timeout: float = DEFAULT_FIRST_VIDEO_TIMEOUT,
+        audio_window: float = DEFAULT_AUDIO_WINDOW,
         ffmpeg_stderr: bool = False,
         connection_id: int | None = None,
         on_event: Callable[[str, float], None] | None = None,
@@ -274,6 +412,7 @@ class CloudSession:
         self._serial = serial
         self._ffmpeg_path = ffmpeg_path
         self._first_video_timeout = first_video_timeout
+        self._audio_window = audio_window
         self._ffmpeg_stderr = ffmpeg_stderr
         self._connection_id = connection_id
         self._on_event = on_event
@@ -287,7 +426,15 @@ class CloudSession:
         self._abort_reason: str | None = None
         self._socket: socket.socket | None = None
         self._ffmpeg: subprocess.Popen[bytes] | None = None
+        self._audio_stdin: BinaryIO | None = None
+        # Seconds into the session at which the audio input was given up as stalled, or None.
+        self._audio_ended_at: float | None = None
         self._writer_error: Exception | None = None
+        # Seconds into the session at which each payload type first carried media. Recorded for
+        # every type, not only the one being served: a window that turned out to be too short
+        # is corrected from this, and it is the reading that separates "this camera has no
+        # audio" from "this camera's audio started after the bridge stopped waiting".
+        self._media_first: dict[int | None, float] = {}
 
     @property
     def abort_reason(self) -> str | None:
@@ -380,6 +527,7 @@ class CloudSession:
 
             # Only now. Closing the descriptor while another thread could still be
             # reading it risks that thread landing on a recycled fd.
+            self._close_audio()
             with suppress(Exception):
                 stream.close()
 
@@ -438,7 +586,7 @@ class CloudSession:
         with suppress(OSError):
             sock.shutdown(socket.SHUT_RDWR)
 
-    def _start_ffmpeg(self, demuxer: str) -> subprocess.Popen[bytes]:
+    def _start_ffmpeg(self, plan: _PayloadPlan) -> subprocess.Popen[bytes]:
         """MPEG-TS out of whatever the camera sent, with no re-encoding.
 
         Two input formats are possible. MPEG-PS is the case this was built for and FFmpeg
@@ -451,7 +599,15 @@ class CloudSession:
         elementary stream has no container to carry a timestamp, and without one the MPEG-TS
         muxer refuses the packet outright -- `first pts and dts value must be set`, zero bytes
         written, for H.264 and HEVC alike. Wallclock is the packet's arrival time, which for a
-        live stream is the right reading anyway.
+        live stream is the right reading anyway, and ADTS carries no presentation time either,
+        so the audio input is given the same one.
+
+        Audio is a second input on its own descriptor. It cannot share the video pipe -- one
+        pipe carries one elementary stream -- and it cannot be a file, because it is being
+        produced as the camera sends it. The descriptor is created here, handed to the child
+        with `pass_fds` and named as `pipe:<fd>`, which is the only spelling that reads a pipe
+        FFmpeg did not open itself; the write end is kept for the pump and released by the
+        teardown.
 
         Normally FFmpeg's stderr is discarded and its level kept at `error`. With the
         diagnostic on it is piped and the level raised to `info`, so the reason a remux
@@ -464,18 +620,43 @@ class CloudSession:
             "-loglevel",
             _FFMPEG_LOG_LEVEL if capturing else "error",
         ]
-        if demuxer != _MPEG_PS_DEMUXER:
+        if plan.demuxer != _MPEG_PS_DEMUXER:
             argv += ["-use_wallclock_as_timestamps", "1"]
-        argv += ["-f", demuxer, "-i", "pipe:0", "-c", "copy", "-f", "mpegts", "pipe:1"]
+        argv += ["-f", plan.demuxer, "-i", "pipe:0"]
+        audio_read: int | None = None
+        audio_write: int | None = None
+        if plan.audio_payload_type is not None:
+            audio_read, audio_write = os.pipe()
+            argv += [
+                "-use_wallclock_as_timestamps",
+                "1",
+                "-f",
+                _AAC_DEMUXER,
+                "-i",
+                f"pipe:{audio_read}",
+            ]
+        argv += ["-c", "copy", "-f", "mpegts", "pipe:1"]
         try:
-            return subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+            process = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
                 argv,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE if capturing else subprocess.DEVNULL,
+                pass_fds=() if audio_read is None else (audio_read,),
             )
         except OSError as err:
+            # Both ends, because neither has a reader now and a leaked descriptor outlives
+            # the session that made it.
+            for descriptor in (audio_read, audio_write):
+                if descriptor is not None:
+                    os.close(descriptor)
             raise PyEzvizError(f"Could not launch FFmpeg at {self._ffmpeg_path!r}: {err}") from err
+        if audio_read is not None and audio_write is not None:
+            # The child holds its own copy of the read end now; keeping ours would mean an
+            # input FFmpeg never sees the end of.
+            os.close(audio_read)
+            self._audio_stdin = os.fdopen(audio_write, "wb")
+        return process
 
     def _launch_remux(
         self, plan: _PayloadPlan
@@ -487,7 +668,7 @@ class CloudSession:
         cancel flag was already set while FFmpeg was starting then `abort()` could not see
         the process at all, so it is stopped here instead of being left running.
         """
-        ffmpeg = self._start_ffmpeg(plan.demuxer)
+        ffmpeg = self._start_ffmpeg(plan)
         with self._lock:
             self._ffmpeg = ffmpeg
             cancelled = self._cancel.is_set()
@@ -586,7 +767,77 @@ class CloudSession:
             # is reported above, but there is no demuxer to choose: nobody is waiting for it,
             # and "the payload names no codec" would be a misleading way to say so.
             return _PayloadPlan("UNKNOWN", _MPEG_PS_DEMUXER, None, None, prefix), packets_iter
-        return self._decide(prefix), packets_iter
+        plan = self._decide(prefix)
+        if plan.codec is not None:
+            # Only for a payload the session depacketizes: an MPEG-PS session carries
+            # whatever it carries, and making it wait for a second payload type would be a
+            # latency bought for a question that path cannot have.
+            plan = self._with_audio(plan, packets_iter)
+        return plan, packets_iter
+
+    def _with_audio(self, plan: _PayloadPlan, packets_iter: Iterator[Any]) -> _PayloadPlan:
+        """Read on until the camera's audio shows up, or the window closes.
+
+        A second RTP payload type carrying media is the camera's audio, and serving it needs a
+        second FFmpeg input -- which has to be in argv before FFmpeg starts, because FFmpeg
+        opens its inputs before it reads any of them and blocks on one that has no frame yet.
+        That is what this read buys, and it is the only thing the video prefix cannot answer.
+
+        The window is a deadline checked as packets arrive, which is the bound that matters for
+        a camera streaming normally: one that sends no audio at all pays it in full, and one
+        that does stops here as soon as its first audio payload arrives -- at a frame every
+        64 ms, a fraction of a second. It is deliberately *not* a bound on how long a single
+        read may block: a camera that falls silent at the prefix boundary holds this read until
+        its next packet or the VTM socket timeout, which is exactly the bound the video prefix
+        read above already runs under, and a shorter one here would mean either a second reader
+        thread or a socket timeout that kills the iterator mid-stream.
+
+        When the window closes without audio, the session still records when a second payload
+        type's media started -- `_report_audio` prints it at the end -- so a window that was
+        too short is corrected from a log line rather than guessed at again.
+
+        A packet read here is kept rather than consumed: it goes out through the pump with the
+        rest of the prefix.
+        """
+        if self._audio_window <= 0:
+            # Also the answer for a session aborted mid-read: nothing more is served, and
+            # "the audio never arrived" would be the wrong way to put it.
+            return plan
+        audio_payload_type = _prefix_audio(plan.payload_type, plan.packets)
+        if audio_payload_type is not None:
+            return replace(plan, audio_payload_type=audio_payload_type)
+        deadline = self._now() + self._audio_window
+        extra: list[bytes] = []
+        buffered = 0
+        audio_payload_type = None
+        try:
+            for packet in packets_iter:
+                if self._cancel.is_set():
+                    break
+                # The deadline is checked for every packet, control traffic included. A camera
+                # that has stopped sending media still sends keepalives, and a session whose
+                # video prefix has already been read has its no-video budget disarmed and its
+                # socket never idle for a timeout -- so a check those packets could step around
+                # would not be a check, and this read sits in `run`'s own thread, before FFmpeg
+                # exists.
+                body = self._accept(packet)
+                if body:
+                    extra.append(body)
+                    buffered += len(body)
+                    payload_type = _payload_type_of(body)
+                    if payload_type != plan.payload_type and _audio_payload(body):
+                        audio_payload_type = payload_type
+                        break
+                if self._now() >= deadline or buffered >= _AUDIO_WINDOW_BYTES:
+                    break
+        except Exception:
+            # The same rule as the prefix read: a shut-down socket is how abort() stops this,
+            # and only an abort makes that an outcome rather than an error.
+            if not self._cancel.is_set():
+                raise
+        return replace(
+            plan, packets=plan.packets + tuple(extra), audio_payload_type=audio_payload_type
+        )
 
     def _decide(self, packets: tuple[bytes, ...]) -> _PayloadPlan:
         """Name the transport, and with it the demuxer FFmpeg will be started with.
@@ -630,10 +881,10 @@ class CloudSession:
         """Check one VTM packet, and return its body when it is video.
 
         None means the packet was not on a video channel; an empty body means it was a video
-        packet with nothing in it. Two things happen here rather than at each of the two call
+        packet with nothing in it. Three things happen here rather than at each of the two call
         sites -- the prefix read and the pump -- because they must happen the same way in both:
-        a video packet is counted once, and `first-video` is recorded once, on the first packet
-        that actually carries media.
+        a video packet is counted once, `first-video` is recorded once, on the first packet that
+        actually carries media, and each payload type is timestamped the first time it does.
         """
         if packet.channel not in _STREAM_CHANNELS:
             return None
@@ -643,8 +894,13 @@ class CloudSession:
             )
         self.metrics.video_packets += 1
         body = packet.body
-        if self.metrics.first_video_at is None and body and _carries_media(body):
-            self._record("first-video")
+        if body and _carries_media(body):
+            if self.metrics.first_video_at is None:
+                self._record("first-video")
+            # One entry per payload type, the first time each carried media. This is what the
+            # audio window is measured against, and the reading that turns "the audio is
+            # missing" into the one number that says how long a window would have had to be.
+            self._media_first.setdefault(_payload_type_of(body), self._now() - self._started)
         return body
 
     def _report_prefix(self, packets: tuple[bytes, ...]) -> None:
@@ -698,7 +954,7 @@ class CloudSession:
     def _pump_vtm_to_ffmpeg(
         self, packets: Iterator[Any], ffmpeg: subprocess.Popen[bytes], plan: _PayloadPlan
     ) -> None:
-        """VTM packets -> FFmpeg stdin, until the stream ends or the session aborts.
+        """VTM packets -> FFmpeg's pipes, until the stream ends or the session aborts.
 
         The leading packets were read before FFmpeg was started, because they are what chose
         its demuxer, so they go in first and the iterator then continues from the packet that
@@ -713,9 +969,34 @@ class CloudSession:
             if plan.codec is not None
             else None
         )
+        audio_depacketizer = (
+            AacHbrDepacketizer(payload_type=plan.audio_payload_type)
+            if plan.audio_payload_type is not None
+            else None
+        )
+        sinks = _Sinks(
+            video=stdin,
+            depacketizer=depacketizer,
+            audio=self._audio_stdin,
+            audio_depacketizer=audio_depacketizer,
+            now=self._now,
+        )
+        # Armed only when there is an audio input to give up, and stopped by the teardown below.
+        # A silent camera's audio must not be able to hold the video behind it, and only a
+        # thread can notice that while the pump is blocked writing.
+        stall_stop, stall_watchdog = self._start_stall_watchdog(sinks, audio_depacketizer)
         try:
-            for body in plan.packets:
-                _forward(stdin, depacketizer, body)
+            if audio_depacketizer is None:
+                self._replay_prefix(sinks, plan)
+            else:
+                # The audio half of the prefix first, and this is an ordering the process
+                # depends on rather than a preference. FFmpeg opened the video input and, if
+                # it has no frame in its pipe yet, blocks there without ever reaching the
+                # audio input; the prefix is already in memory, so the packets are written in
+                # the only order that cannot fill a pipe waiting for a reader that is waiting
+                # for the pipe.
+                self._replay_prefix(sinks, plan, audio=True)
+                self._replay_prefix(sinks, plan, audio=False)
 
             # include_control=True is what makes an idle session interruptible: while
             # the camera sleeps the only traffic is control packets, which the library
@@ -726,7 +1007,7 @@ class CloudSession:
                     break
                 body = self._accept(packet)
                 if body is not None:
-                    _forward(stdin, depacketizer, body)
+                    sinks.feed(body)
         except (BrokenPipeError, ConnectionResetError):
             # FFmpeg is gone; the reader side reports why the session ended.
             return
@@ -736,22 +1017,15 @@ class CloudSession:
             if not self._cancel.is_set():
                 self._writer_error = err
         finally:
+            stall_stop.set()
+            if stall_watchdog is not None:
+                stall_watchdog.join(timeout=_AUDIO_STALL_POLL + _WRITER_JOIN_TIMEOUT)
             if depacketizer is not None:
-                # A fragment whose end never arrived is media that did not make it out, and it
-                # belongs in the counts below rather than in silence.
-                depacketizer.flush()
-                self._report_payload_types(depacketizer)
-                if depacketizer.dropped or depacketizer.skipped:
-                    # The difference between "the camera sent nothing" and "the camera sent
-                    # something this bridge misread" is the whole reason these counts exist.
-                    _LOGGER.warning(
-                        "[FFmpeg] %sthe %s depacketizer dropped %d unreadable packet(s) and "
-                        "skipped %d carrying another RTP payload type",
-                        self._label(),
-                        depacketizer.codec,
-                        depacketizer.dropped,
-                        depacketizer.skipped,
-                    )
+                self._finish_depacketizer(depacketizer)
+                self._report_audio(audio_depacketizer, plan.payload_type)
+            # Order matters only for tidiness: FFmpeg is already gone, and a write end left
+            # open would keep its reader from seeing EOF.
+            self._close_audio()
             # EOF for FFmpeg, which is what ends a session that stopped on its own.
             with suppress(OSError):
                 stdin.close()
@@ -804,6 +1078,189 @@ class CloudSession:
                 self._label(),
                 len(stats) - _PAYLOAD_TYPE_REPORT_MAX,
             )
+
+    def _end_stalled_audio(self, sinks: _Sinks) -> None:
+        """Give the audio input up when it has gone quiet long enough to hold the video back.
+
+        Nothing about this is optional. FFmpeg reads a packet from every input before it muxes
+        any, so an input the camera has stopped feeding is not silence to FFmpeg, it is a demuxer
+        thread blocked in `read` -- with the muxer behind it waiting for that stream, the video
+        pipe filling, and the session producing nothing at all while the camera keeps streaming.
+        Measured: a stack sample of the stalled process sits in `read` on the audio descriptor,
+        and closing its write end brings the video back within a few seconds. The alternative to
+        this is a session that dies silently the first time the camera pauses its audio.
+
+        What it costs is stated where it is decided: from here on this session has no sound. The
+        threshold and the reason it is long are on `_AUDIO_STALL_SECONDS`.
+        """
+        if not sinks.give_up_audio():
+            return
+        self._audio_ended_at = sinks.now() - self._started
+        _LOGGER.warning(
+            "[FFmpeg] %saudio: nothing from the camera for %gs, so the audio input is ended "
+            "and this session keeps the video only; FFmpeg stops muxing altogether on an "
+            "input with no data in it",
+            self._label(),
+            _AUDIO_STALL_SECONDS,
+        )
+
+    def _start_stall_watchdog(
+        self, sinks: _Sinks, audio_depacketizer: AacHbrDepacketizer | None
+    ) -> tuple[threading.Event, threading.Thread | None]:
+        """Arm the audio-stall watchdog. Returns its stop signal, and the thread when there is
+        an audio input for it to give up."""
+        stop = threading.Event()
+        if audio_depacketizer is None:
+            return stop, None
+        watchdog = threading.Thread(
+            target=self._watch_audio_stall,
+            args=(sinks, stop),
+            name=f"audio-stall-{self._serial}",
+            daemon=True,
+        )
+        watchdog.start()
+        return stop, watchdog
+
+    def _watch_audio_stall(self, sinks: _Sinks, stop: threading.Event) -> None:
+        """Call `_end_stalled_audio` when the clock says so, whatever the pump is doing.
+
+        A thread, because the pump is the one that would otherwise make the decision and it is
+        the one that is blocked by then: the video pipe stops being drained the moment FFmpeg's
+        audio demuxer starts waiting, and it holds well under a second of a 1080p stream, so the
+        pump is inside `stdin.write` long before a silent audio input has been silent long
+        enough. Daemon and polling, so a session that ends normally leaves nothing behind.
+        """
+        while not stop.wait(_AUDIO_STALL_POLL):
+            if sinks.audio is None:
+                return
+            if sinks.now() - sinks.audio_at > _AUDIO_STALL_SECONDS:
+                self._end_stalled_audio(sinks)
+                return
+
+    def _replay_prefix(
+        self, sinks: _Sinks, plan: _PayloadPlan, *, audio: bool | None = None
+    ) -> None:
+        """Write the leading packets, in one pass, or in the audio half of one.
+
+        `audio` selects which half: None writes all of them in order, True only the audio
+        packet(s), False only the rest. It exists because the audio has to be in its pipe
+        before anything can fill the video pipe -- see the pump -- and because doing that here,
+        once, keeps the two passes from being two loops that quietly disagree about which
+        packet belongs to which half.
+        """
+        for body in plan.packets:
+            owns = sinks.owns_audio(body)
+            if audio is None or owns == audio:
+                sinks.feed(body)
+
+    def _finish_depacketizer(self, depacketizer: RtpDepacketizer) -> None:
+        """Flush and report one codec's depacketizer, where the stream ends rather than where
+        it breaks.
+
+        A fragment whose end never arrived is media that did not make it out, and it belongs
+        in the counts rather than in silence; and the difference between "the camera sent
+        nothing" and "the camera sent something this bridge misread" is the whole reason
+        those counts exist, so a non-zero one is said loudly and not only printed.
+        """
+        depacketizer.flush()
+        self._report_payload_types(depacketizer)
+        if depacketizer.dropped or depacketizer.skipped:
+            _LOGGER.warning(
+                "[FFmpeg] %sthe %s depacketizer dropped %d unreadable packet(s) and "
+                "skipped %d carrying another RTP payload type",
+                self._label(),
+                depacketizer.codec,
+                depacketizer.dropped,
+                depacketizer.skipped,
+            )
+
+    def _report_audio(
+        self, audio: AacHbrDepacketizer | None, video_payload_type: int | None
+    ) -> None:
+        """Say what became of the camera's audio, including when nothing did.
+
+        The line that matters when this goes wrong is the one carrying the time a second
+        payload type's media actually started, beside the time the video did and the window
+        the session was willing to wait: the window is the one number that decides whether a
+        camera's audio is served, and a number nobody can correct from a log is a number that
+        stays wrong. That is why the offset is recorded for every payload type, not only for
+        the one being served -- the case worth explaining is the one where the audio is never
+        handed to FFmpeg at all.
+
+        The keys are guaranteed: a payload type reaches `_media_first` on the same packet that
+        the audio detection and the codec detection read, and neither reads a packet that
+        carries no media.
+        """
+        others = {
+            payload_type: at
+            for payload_type, at in self._media_first.items()
+            if payload_type is not None and payload_type != video_payload_type
+        }
+        video_at = self._media_first.get(video_payload_type, 0.0)
+        if audio is not None:
+            _LOGGER.info(
+                "[FFmpeg] %saudio: PT%s %s config=%#06x (%s), %d packet(s), %d AU(s), "
+                "%d unreadable, first media at +%.3fs (video at +%.3fs)",
+                self._label(),
+                audio.payload_type,
+                audio.codec,
+                audio.config,
+                describe_config(audio.config),
+                audio.packets,
+                audio.aus,
+                audio.dropped,
+                self._media_first[audio.payload_type],
+                video_at,
+            )
+            if self._audio_ended_at is not None:
+                _LOGGER.info(
+                    "[FFmpeg] %sthe audio input was ended at +%.3fs of silence from the camera; "
+                    "what was written before that is in the stream",
+                    self._label(),
+                    self._audio_ended_at,
+                )
+            if audio.dropped:
+                _LOGGER.warning(
+                    "[FFmpeg] %sthe %s depacketizer dropped %d packet(s): the camera's audio "
+                    "is not the shape this bridge reads it as",
+                    self._label(),
+                    audio.codec,
+                    audio.dropped,
+                )
+            return
+        for payload_type, at in others.items():
+            _LOGGER.info(
+                "[FFmpeg] %spayload type PT%s carried media, first at +%.3fs (video at "
+                "+%.3fs), and was not served: %s",
+                self._label(),
+                payload_type,
+                at,
+                video_at,
+                (
+                    f"it started past the {self._audio_window:g}s audio window"
+                    if self._audio_window > 0
+                    else "the audio path is off (audio_window 0)"
+                ),
+            )
+        if not others and self._audio_window > 0 and self._ffmpeg_stderr:
+            # Behind the diagnostic, unlike the two lines above: it is the shape of every RTP
+            # session whose camera has no audio, which is not a fault and not something to
+            # print on every session that runs. The lines above are not, because a second
+            # stream being thrown away is exactly what somebody has to be able to see.
+            _LOGGER.info(
+                "[FFmpeg] %saudio: no media on a second payload type within %gs of the video "
+                "prefix; serving video only",
+                self._label(),
+                self._audio_window,
+            )
+
+    def _close_audio(self) -> None:
+        """Release the audio pipe, once, whichever path is tearing the session down."""
+        with self._lock:
+            pipe, self._audio_stdin = self._audio_stdin, None
+        if pipe is not None:
+            with suppress(OSError):
+                pipe.close()
 
     def _pump_ffmpeg_to_consumer(self, ffmpeg: subprocess.Popen[bytes], output: BinaryIO) -> None:
         """FFmpeg stdout -> the consumer, until EOF or the session is cancelled.

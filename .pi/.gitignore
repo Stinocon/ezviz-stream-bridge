@@ -1,3 +1,7 @@
 # The work-log is local: it carries the state of a session, not of the project. Decisions are
 # not: they are the invariants a later change has to respect, so they are tracked.
 memory/
+
+# The verification trail is derived from the decisions and the repository, and is rebuilt on
+# demand -- committing it would mean reviewing a generated file on every change.
+decisions/verification.json

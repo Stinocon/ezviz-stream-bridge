@@ -85,16 +85,19 @@ class _FakeProcess:
         return None
 
 
-def _supervisor(*, log_ffmpeg_stderr: bool = False) -> Supervisor:
-    config = BridgeConfig.from_options(
-        {
-            "username": "user@example.com",
-            "password": "secret",
-            "region": "apiieu.ezvizlife.com",
-            "cameras": [{"serial": "BB1234567", "port": 8558}],
-            "log_ffmpeg_stderr": log_ffmpeg_stderr,
-        }
-    )
+def _supervisor(
+    *, log_ffmpeg_stderr: bool = False, audio_window: float | None = None
+) -> Supervisor:
+    options: dict[str, object] = {
+        "username": "user@example.com",
+        "password": "secret",
+        "region": "apiieu.ezvizlife.com",
+        "cameras": [{"serial": "BB1234567", "port": 8558}],
+        "log_ffmpeg_stderr": log_ffmpeg_stderr,
+    }
+    if audio_window is not None:
+        options["audio_window"] = audio_window
+    config = BridgeConfig.from_options(options)
     return Supervisor(config, _FakeTokens())  # type: ignore[arg-type]
 
 
@@ -113,3 +116,26 @@ def test_ffmpeg_diagnostic_flag_reaches_the_proxy_command(
     supervisor._start(supervisor._proxies[0])
 
     assert ("--log-ffmpeg-stderr" in captured["command"]) is enabled
+
+
+def test_the_audio_window_reaches_the_proxy_only_when_it_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The proxy holds the default, so an add-on that passes nothing must pass nothing: a flag
+    on every command line would be a number in two places, and the one in the add-on would
+    silently win."""
+    captured: dict[str, list[str]] = {}
+
+    def fake_popen(command: list[str]) -> _FakeProcess:
+        captured["command"] = command
+        return _FakeProcess()
+
+    monkeypatch.setattr(supervisor_module.subprocess, "Popen", fake_popen)
+    supervisor = _supervisor()
+    supervisor._start(supervisor._proxies[0])
+    assert "--audio-window" not in captured["command"]
+
+    passed = _supervisor(audio_window=1.5)
+    passed._start(passed._proxies[0])
+    command = captured["command"]
+    assert command[command.index("--audio-window") + 1] == "1.5"

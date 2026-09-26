@@ -9,6 +9,7 @@ seconds after start-up.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,10 @@ class BridgeConfig:
     cameras: tuple[CameraConfig, ...]
     log_level: str
     log_ffmpeg_stderr: bool = False
+    # Seconds the bridge reads ahead for the camera's audio before it starts FFmpeg. None means
+    # the option was not set at all, and the proxy's own default applies: the add-on always
+    # writes it because `config.yaml` declares it, but a hand-written options.json need not.
+    audio_window: float | None = None
 
     @classmethod
     def from_options(cls, options: dict[str, Any]) -> BridgeConfig:
@@ -91,7 +96,29 @@ class BridgeConfig:
             cameras=cameras,
             log_level=str(options.get("log_level") or "info").lower(),
             log_ffmpeg_stderr=cls._as_bool(options.get("log_ffmpeg_stderr")),
+            audio_window=cls._as_seconds(options.get("audio_window"), "audio_window"),
         )
+
+    @staticmethod
+    def _as_seconds(value: Any, option: str) -> float | None:
+        """Read a duration option, which may arrive as a number or as its text form.
+
+        None and the empty string both mean "not set", and the caller's own default then
+        applies. A negative value is refused here rather than silently clamped, because the
+        only honest reading of a negative window is that the option was misunderstood.
+        """
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError) as err:
+            raise ConfigError(f"{option} is not a number of seconds: {value!r}") from err
+        if not math.isfinite(seconds) or seconds < 0:
+            # `nan` and `inf` parse as floats and then disarm every comparison they are used in,
+            # which here would turn a bounded wait into an unbounded one -- silently, and from
+            # a value no operator meant to write.
+            raise ConfigError(f"{option} is not a finite number of seconds: {value!r}")
+        return seconds
 
     @staticmethod
     def _as_bool(value: Any) -> bool:

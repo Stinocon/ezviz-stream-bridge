@@ -1,4 +1,4 @@
-"""RTP depacketization: RFC 6184 (H.264) and RFC 7798 (HEVC) into an Annex-B stream.
+"""RTP depacketization: RFC 6184/7798 video into Annex-B, RFC 3640 audio into ADTS.
 
 The VTM payload is not always MPEG-PS. A CS-C8c sends its video as RTP with payload type 96
 carrying RFC 6184 H.264, and FFmpeg's `mpeg` demuxer cannot read a byte of it: fed that
@@ -8,14 +8,20 @@ not fix it either -- `-f rtp` wants a UDP URL and an SDP, and the packets are al
 so the packaging is undone in this process, where the reassembly can also be tested against
 the bytes a real camera sent.
 
+The same session also carries the camera's audio, under a second payload type. A CS-C8c sends
+it as RFC 3640 MPEG4-GENERIC in `AAC-hbr` mode, which is the other half of the same problem:
+FFmpeg has a demuxer for it (`aac`) and that demuxer reads ADTS, which the payload does not
+carry -- the SDP does, as an AudioSpecificConfig. So the Access Units are unwrapped here and
+reframed, exactly as the video NAL units are.
+
 Only the packaging is handled here. Where the payload starts inside a packet (CSRC list,
 header extension, padding) comes from `pyezvizapi.stream.rtp_payload` -- the same unwrap the
 diagnostic logs, so there is one implementation of the offset rule and not two.
 
-Deliberately not handled, because nothing this bridge has seen emits them: H.264 FU-B and
-HEVC PACI. A packet carrying one is dropped and counted, as is any packet whose NAL header is
-not valid for the codec the session settled on. A payload the depacketizer cannot make sense
-of has to be visible as a number, not as silence.
+Deliberately not handled, because nothing this bridge has seen emits them: H.264 FU-B,
+HEVC PACI and RFC 3640 fragmentation. A packet carrying one is dropped and counted, as is any
+packet whose NAL header is not valid for the codec the session settled on. A payload the
+depacketizer cannot make sense of has to be visible as a number, not as silence.
 """
 
 from __future__ import annotations
@@ -83,6 +89,47 @@ _MAX_NAL_BYTES = 4 * 1024 * 1024
 # Payload bytes kept per type for the breakdown. Enough to name a codec from its own header --
 # an ADTS frame, a G.711 sample, a NAL unit -- and not enough to keep a packet.
 _SAMPLE_BYTES = 32
+
+# RFC 3640 MPEG4-GENERIC in `AAC-hbr` mode, which is what an EZVIZ/Hikvision camera signals
+# for its audio: `mode=AAC-hbr; sizelength=13; indexlength=3; indexdeltalength=3; config=1408`.
+# The two lengths are what make an AU header exactly 16 bits -- 13 of size and 3 of index --
+# which is why a two-byte AU-header section always holds a whole number of them, and why the
+# session's first audio payload (`00 10 | 07 20`) reads as one 228-byte Access Unit.
+AAC_HBR = "aac-hbr"
+_AAC_SIZE_LENGTH = 13
+_AAC_INDEX_LENGTH = 3
+_AAC_AU_HEADER_BITS = _AAC_SIZE_LENGTH + _AAC_INDEX_LENGTH
+
+# The AU-headers-length field that opens the AU header section (RFC 3640 3.2.1).
+_AU_HEADERS_LENGTH_BYTES = 2
+
+# AudioSpecificConfig 0x1408, the value those SDPs carry: AAC-LC (audio object type 2),
+# sampling frequency index 8 (16000 Hz), channel configuration 1 (mono). The rate is confirmed
+# twice -- by the family's SDP convention and by the cadence of the reporter's own session
+# (1081 packets in 69.76 s = 64.5 ms, which is 1024 samples at 16000 Hz). Mono is the
+# convention, and the only reading the payload sizes allow: 228 bytes per 64 ms is ~28 kbit/s,
+# where the same audio in stereo would be about twice that. Every session that handles audio
+# logs this config, so a camera that differs is visible instead of silent.
+AAC_LC_16K_MONO = 0x1408
+
+# Audio object types whose name is worth printing in a log line. ADTS cannot describe any
+# other, so a config naming one never reaches a stream.
+_AAC_OBJECT_TYPES = {1: "AAC-Main", 2: "AAC-LC", 3: "AAC-SSR", 4: "AAC-LTP"}
+
+# Sampling frequency by index, in the order ISO/IEC 14496-3 assigns them. The last three are
+# the reserved values, which nothing legal writes.
+_AAC_FREQUENCIES = (
+    96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
+    16000, 12000, 11025, 8000, 7350,
+)
+
+# ADTS, the framing FFmpeg's `aac` demuxer reads and the only one it reads. Its frame_length
+# field is 13 bits and counts the header, so this is the largest Access Unit it can describe.
+_ADTS_HEADER_BYTES = 7
+_ADTS_MAX_AU_BYTES = (1 << 13) - 1 - _ADTS_HEADER_BYTES
+# ADTS carries the profile in two bits, as `audio_object_type - 1`, over a range that starts at
+# 1 for the object types the header can describe. AOT 5 (SBR) and above cannot be expressed.
+_ADTS_MAX_OBJECT_TYPE = 4
 
 
 @dataclass
@@ -414,3 +461,178 @@ class RtpDepacketizer:
 
     def _drop(self) -> None:
         self.dropped += 1
+
+
+# -- RFC 3640 (MPEG4-GENERIC, AAC-hbr) --------------------------------------------
+
+
+def parse_au_section(payload: bytes) -> list[bytes] | None:
+    """Split an RFC 3640 AU header section into its Access Units, or None if it is not one.
+
+    The section is a 16-bit bit-length followed by that many bits of AU headers, then the
+    Access Units concatenated. Because a header is a 13-bit size beside a 3-bit index -- the
+    lengths the camera's own SDP names -- the section is always a whole number of two-byte
+    headers, and it is byte aligned, which is where the media starts.
+
+    The sum is what makes this a reading rather than a guess: the sizes have to account for
+    every remaining byte of the payload, exactly. A hasty parse that only checked the first
+    size would accept anything, and one that accepted a short sum would read the tail of an
+    unrelated payload as audio. Nothing here is lenient for the same reason `detect_codec`
+    is not: this doubles as the test that a second payload type is audio at all, and silence
+    that sounds like success is the failure being designed against.
+
+    Deliberately not handled: an Access Unit split across packets. `AAC-hbr` is the mode that
+    requires one Access Unit per packet (RFC 3640 3.3.6), so a set of sizes that does not add
+    up is not a fragment to reassemble, it is a payload this does not understand.
+    """
+    if len(payload) < _AU_HEADERS_LENGTH_BYTES:
+        return None
+    section_bits = int.from_bytes(payload[:_AU_HEADERS_LENGTH_BYTES], "big")
+    if section_bits < _AAC_AU_HEADER_BITS or section_bits % _AAC_AU_HEADER_BITS:
+        return None
+    count = section_bits // _AAC_AU_HEADER_BITS
+    section_bytes = _AU_HEADERS_LENGTH_BYTES + section_bits // 8
+    if section_bytes > len(payload):
+        return None
+
+    sizes: list[int] = []
+    offset = _AU_HEADERS_LENGTH_BYTES
+    for _ in range(count):
+        sizes.append(int.from_bytes(payload[offset : offset + 2], "big") >> _AAC_INDEX_LENGTH)
+        offset += 2
+    if any(size == 0 for size in sizes) or section_bytes + sum(sizes) != len(payload):
+        return None
+
+    units: list[bytes] = []
+    for size in sizes:
+        units.append(payload[offset : offset + size])
+        offset += size
+    return units
+
+
+def adts_frame(unit: bytes, config: int = AAC_LC_16K_MONO) -> bytes:
+    """Wrap one Access Unit in the 7-byte ADTS header FFmpeg's `aac` demuxer reads.
+
+    RFC 3640 sends an AAC Access Unit bare, because the profile, sampling frequency and
+    channel configuration an ADTS header would repeat are in the SDP instead. Rebuilding the
+    header here is what turns the one back into the other, and it is why the config is a
+    parameter: it is the one piece of the payload's meaning that is not in the payload.
+
+    Buffer fullness is written as its 0x7FF "unknown" code and the raw data block count as
+    zero. Neither carries anything for a stream being remuxed, and any other value would be an
+    invented measurement in a header that FFmpeg has no reason to disbelieve.
+    """
+    profile = ((config >> 11) & 0x1F) - 1
+    frequency = (config >> 7) & 0x0F
+    channels = (config >> 3) & 0x07
+    length = len(unit) + _ADTS_HEADER_BYTES
+    return (
+        bytes(
+            (
+                0xFF,
+                0xF1,
+                ((profile & 0x03) << 6) | (frequency << 2) | ((channels >> 2) & 0x01),
+                ((channels & 0x03) << 6) | ((length >> 11) & 0x03),
+                (length >> 3) & 0xFF,
+                ((length & 0x07) << 5) | 0x1F,
+                0xFC,
+            )
+        )
+        + unit
+    )
+
+
+def carries_aac_hbr(payload: bytes) -> bool:
+    """True when a payload is an AU header section whose Access Units this can frame.
+
+    Asked ahead of the depacketizer, by a session deciding whether to give the stream a second
+    FFmpeg input. That decision has to know a frame will come out of it: FFmpeg opens its
+    inputs before it reads any of them, and blocks on one that has no frame yet, so an input
+    primed with nothing is not "audio that has not started", it is a session that never
+    starts. Saying so here, in terms of the same check the depacketizer makes, is what keeps
+    the promise from being a second, weaker copy of it.
+    """
+    units = parse_au_section(payload)
+    return units is not None and all(len(unit) <= _ADTS_MAX_AU_BYTES for unit in units)
+
+
+def describe_config(config: int = AAC_LC_16K_MONO) -> str:
+    """The AudioSpecificConfig spelled out, for a log line somebody has to be able to check.
+
+    Four hex digits say nothing on their own, and this is the one parameter of the audio path
+    that is not in the payload: it comes from the camera's SDP, which this bridge never sees.
+    Printing the rate and the channel count is what turns "the audio is wrong on my camera"
+    into a number somebody can compare against that same camera's RTSP SDP.
+    """
+    object_type = (config >> 11) & 0x1F
+    frequency = (config >> 7) & 0x0F
+    channels = (config >> 3) & 0x07
+    name = _AAC_OBJECT_TYPES.get(object_type, f"object type {object_type}")
+    if frequency < len(_AAC_FREQUENCIES):
+        rate = f"{_AAC_FREQUENCIES[frequency]} Hz"
+    else:
+        rate = f"frequency index {frequency} (reserved)"
+    # 0 is not "no channels": the specification uses it to say the layout is carried in-band.
+    layout = {0: "layout in the stream", 1: "mono"}.get(channels, f"{channels} channels")
+    return f"{name}, {rate}, {layout}"
+
+
+class AacHbrDepacketizer:
+    """RFC 3640 MPEG4-GENERIC AAC payloads, turned into the ADTS stream FFmpeg reads.
+
+    Not an `RtpDepacketizer`: that one is bound to a codec whose bytes it validates as NAL
+    units, and it holds the fragment being reassembled. Nothing here is fragmented and nothing
+    is reassembled -- a packet carries whole Access Units and each one is framed on the spot --
+    so the only state is the counters.
+
+    `dropped` counts packets whose payload is not an AU header section and Access Units too
+    large to describe in an ADTS frame. A session reporting zero is the evidence that the
+    format was read right, which is why the number is printed even when it is reassuring.
+    """
+
+    def __init__(
+        self, *, config: int = AAC_LC_16K_MONO, payload_type: int | None = None
+    ) -> None:
+        object_type = (config >> 11) & 0x1F
+        if not 1 <= object_type <= _ADTS_MAX_OBJECT_TYPE:
+            # The header below builds `object_type - 1` into two bits, which is a lie for an
+            # object type the field cannot hold. Refusing here keeps that from being a stream
+            # that decodes to noise.
+            raise ValueError(f"AudioSpecificConfig {config:#06x} is not an ADTS profile")
+        self.codec = AAC_HBR
+        self.config = config
+        self.payload_type = payload_type
+        self.packets = 0
+        self.aus = 0
+        self.dropped = 0
+        self.skipped = 0
+
+    def feed(self, packet: bytes) -> bytes:
+        """The ADTS bytes one RTP packet contributes, empty when it contributes none."""
+        try:
+            payload = rtp_payload(packet)
+        except PyEzvizError:
+            self.dropped += 1
+            return b""
+        self.packets += 1
+        if self.payload_type is not None and _payload_type(packet) != self.payload_type:
+            self.skipped += 1
+            return b""
+        if not payload:
+            # A packet carrying only a header extension, as the CS-C8c's first two are.
+            return b""
+        units = parse_au_section(payload)
+        if units is None:
+            self.dropped += 1
+            return b""
+        frames = bytearray()
+        for unit in units:
+            if len(unit) > _ADTS_MAX_AU_BYTES:
+                # All or nothing for the packet: a partial one would frame an Access Unit
+                # whose size the reader cannot know, and a wrong frame is worse than a
+                # missing one.
+                self.dropped += 1
+                return b""
+            frames += adts_frame(unit, self.config)
+        self.aus += len(units)
+        return bytes(frames)

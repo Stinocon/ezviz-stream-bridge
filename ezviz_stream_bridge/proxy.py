@@ -44,7 +44,7 @@ from pyezvizapi.client import EzvizClient
 from pyezvizapi.exceptions import DeviceException, PyEzvizError
 
 from .log import configure_logging, level_for
-from .session import DEFAULT_FIRST_VIDEO_TIMEOUT, CloudSession
+from .session import DEFAULT_AUDIO_WINDOW, DEFAULT_FIRST_VIDEO_TIMEOUT, CloudSession
 from .token import read_token_file
 
 _LOGGER = logging.getLogger(__name__)
@@ -81,6 +81,7 @@ class ProxyServer(ThreadingHTTPServer):
         first_video_timeout: float = DEFAULT_FIRST_VIDEO_TIMEOUT,
         timeout_cooldown: float = TIMEOUT_COOLDOWN,
         ffmpeg_stderr: bool = False,
+        audio_window: float = DEFAULT_AUDIO_WINDOW,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -91,6 +92,7 @@ class ProxyServer(ThreadingHTTPServer):
         self.first_video_timeout = first_video_timeout
         self.timeout_cooldown = timeout_cooldown
         self.ffmpeg_stderr = ffmpeg_stderr
+        self.audio_window = audio_window
         self._now = monotonic
         self._sleep = sleep
         self._cooldown_until = 0.0
@@ -231,6 +233,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             server.serial,
             ffmpeg_path=server.ffmpeg_path,
             first_video_timeout=server.first_video_timeout,
+            audio_window=server.audio_window,
             ffmpeg_stderr=server.ffmpeg_stderr,
             connection_id=conn_id,
             on_event=lambda event, elapsed: _log_session_event(conn_id, event, elapsed),
@@ -355,6 +358,16 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--audio-window",
+        type=float,
+        default=DEFAULT_AUDIO_WINDOW,
+        help=(
+            "seconds to keep reading the leading packets for the camera's audio before "
+            "starting FFmpeg, which is what lets a stream carry its sound; 0 serves video "
+            f"only (default: {DEFAULT_AUDIO_WINDOW:g})"
+        ),
+    )
+    parser.add_argument(
         "--log-ffmpeg-stderr",
         action="store_true",
         help=(
@@ -386,6 +399,7 @@ def main(argv: list[str] | None = None) -> int:
             ffmpeg_path=args.ffmpeg_path,
             first_video_timeout=args.first_video_timeout,
             timeout_cooldown=args.timeout_cooldown,
+            audio_window=args.audio_window,
             ffmpeg_stderr=args.log_ffmpeg_stderr,
         )
     except OSError as err:

@@ -13,6 +13,7 @@ to stdout so the forwarding path can be checked without a camera.
 
 from __future__ import annotations
 
+import io
 import logging
 import socket
 import threading
@@ -26,7 +27,7 @@ from pyezvizapi.exceptions import PyEzvizError
 from pyezvizapi.stream import VtmChannel
 
 from ezviz_stream_bridge import session as session_module
-from ezviz_stream_bridge.rtp import H264, RtpDepacketizer
+from ezviz_stream_bridge.rtp import H264, AacHbrDepacketizer, RtpDepacketizer, adts_frame
 from ezviz_stream_bridge.session import CloudSession, classify_payload
 
 # Generous: the teardown paths under test are meant to take milliseconds. These bounds
@@ -67,6 +68,9 @@ START_CODE = b"\x00\x00\x00\x01"
 # One MPEG-PS pack start code with a body: enough for the transport verdict, for the tests
 # whose subject is not the RTP path.
 PS_PACKET = b"\x00\x00\x01\xba" + b"data"
+
+# The H.264 SPS of the reported session, and the payload that names the codec.
+SPS_PAYLOAD = b"\x67\x4d\x00\x32\x8d\x8d\x40\x14"
 
 
 def rtp_packet(  # noqa: PLR0913 - one per header field the tests vary, all keyword-only
@@ -576,6 +580,23 @@ def _loglevel_arg(args_file: Path) -> str:
     return args[args.index("-loglevel") + 1]
 
 
+def _video_plan(demuxer: str, *, audio: int | None = None) -> Any:
+    """A payload plan just complete enough to build FFmpeg's argv from, which is the subject."""
+    codec = None if demuxer == "mpeg" else demuxer
+    return session_module._PayloadPlan("RTP", demuxer, codec, 96 if codec else None, (), audio)
+
+
+def audio_packet(unit: bytes, *, payload_type: int = 104) -> bytes:
+    """One AAC-hbr packet as this camera sends it: the AU header section, then the Access Unit.
+
+    The single-Unit shape 0x1408 implies -- a 16-bit AU-headers-length and one 13-bit size
+    beside a 3-bit index -- rather than the general builder, because these tests are about what
+    the session does with such a packet and not about how one is assembled.
+    """
+    section = (16).to_bytes(2, "big") + (len(unit) << 3).to_bytes(2, "big")
+    return rtp_packet(section + unit, payload_type=payload_type)
+
+
 def test_ffmpeg_stderr_is_captured_and_bounded(vtm, tmp_path, caplog) -> None:
     """The diagnostic the issue asked for: FFmpeg's own words, not DEVNULL.
 
@@ -802,7 +823,7 @@ def test_stderr_pipe_matches_the_diagnostic_flag(fake_ffmpeg, capturing: bool) -
     session = CloudSession(
         object(), "BB1234567", ffmpeg_path=fake_ffmpeg, ffmpeg_stderr=capturing
     )
-    process = session._start_ffmpeg("mpeg")
+    process = session._start_ffmpeg(_video_plan("mpeg"))
     try:
         assert (process.stderr is None) is not capturing
     finally:
@@ -825,7 +846,7 @@ def test_ffmpeg_is_told_what_it_is_reading(
     ffmpeg_path, args_file = _arg_recording_ffmpeg(tmp_path, stderr_lines=0)
     session = CloudSession(object(), "BB1234567", ffmpeg_path=ffmpeg_path)
 
-    process = session._start_ffmpeg(demuxer)  # noqa: SLF001 - the argv is the subject
+    process = session._start_ffmpeg(_video_plan(demuxer))  # noqa: SLF001 - the argv is the subject
     try:
         process.stdin.close()
         process.wait(timeout=TEARDOWN_LIMIT)
@@ -1304,3 +1325,352 @@ def test_packet_dump_needs_the_diagnostic_flag(vtm, fake_ffmpeg, caplog) -> None
         vtm, fake_ffmpeg, rtp_packet(b"\x40\x01" + b"\xaa" * 30), stderr=False
     )
     assert not _diagnostic_lines(caplog)
+
+
+# -- the audio path --------------------------------------------------------------------
+
+
+class SlowVtmStream(FakeVtmStream):
+    """A VTM that hands packets over one at a time, with a pause between them.
+
+    The pause is what makes the window observable: the deadline is checked as packets arrive, so
+    a stream that never pauses cannot overrun it, and a stream that does pause is the case where
+    the window runs out while the camera is still talking.
+    """
+
+    PAUSE = 0.03
+
+    def __init__(self, sock: socket.socket, packets: list[FakePacket] | None = None) -> None:
+        super().__init__(sock, list(packets or []), silent_after=False)
+
+    def iter_packets(self, *, include_control: bool = False, **_: Any):
+        self.iterating.set()
+        for packet in self._packets:
+            yield packet
+            time.sleep(self.PAUSE)
+        return
+        yield  # pragma: no cover - makes this a generator
+
+
+class BareStream:
+    """Just the one method `_read_prefix` uses, so a plan can be read without a socket."""
+
+    def __init__(self, packets: list[FakePacket]) -> None:
+        self._packets = packets
+
+    def iter_packets(self, *, include_control: bool = False):
+        return iter(self._packets)
+
+
+@pytest.fixture
+def two_input_ffmpeg(tmp_path: Path) -> tuple[str, Path, Path]:
+    """A remux that reads the video pipe on stdin and every other pipe it was handed, and
+    keeps both in files.
+
+    In Python rather than a shell one-liner because the audio descriptor number only exists
+    once the session has made the pipe, so no fixed argv can name it here.
+    """
+    script = tmp_path / "two-input-ffmpeg"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "def drain(fd):\n"
+        "    out = b''\n"
+        "    while True:\n"
+        "        chunk = os.read(fd, 65536)\n"
+        "        if not chunk:\n"
+        "            return out\n"
+        "        out += chunk\n"
+        "\n"
+        "extra = [\n"
+        "    int(arg.split(':')[1])\n"
+        "    for arg in sys.argv[1:]\n"
+        "    if arg.startswith('pipe:') and arg not in ('pipe:0', 'pipe:1')\n"
+        "]\n"
+        "video = sys.stdin.buffer.read()\n"
+        "audio = b''.join(drain(fd) for fd in extra)\n"
+        "for suffix, payload in (('.video', video), ('.audio', audio)):\n"
+        "    with open(sys.argv[0] + suffix, 'wb') as handle:\n"
+        "        handle.write(payload)\n"
+    )
+    script.chmod(0o755)
+    return str(script), Path(f"{script}.video"), Path(f"{script}.audio")
+
+
+def test_ffmpeg_is_given_a_second_input_reading_adts(tmp_path: Path) -> None:
+    """The audio is a second input on its own descriptor: it cannot share the video pipe, and
+    it cannot be a file. `pipe:<fd>` beside `pass_fds` is the only way to name a descriptor
+    FFmpeg did not open itself, and the video stays the first input it reads."""
+    ffmpeg_path, args_file = _arg_recording_ffmpeg(tmp_path, stderr_lines=0)
+    session = CloudSession(object(), "BB1234567", ffmpeg_path=ffmpeg_path)
+
+    process = session._start_ffmpeg(_video_plan("h264", audio=104))
+    try:
+        process.stdin.close()
+        process.wait(timeout=TEARDOWN_LIMIT)
+    finally:
+        process.stdout.close()
+
+    args = args_file.read_text(encoding="utf-8").splitlines()
+    assert args[args.index("-f") + 1] == "h264"
+    audio_at = args.index("aac")
+    assert args[audio_at - 1] == "-f"
+    assert args[audio_at + 1] == "-i"
+    assert int(args[audio_at + 2].split(":")[1]) > 2, "a descriptor of our own, not a standard one"
+    assert session._audio_stdin is not None
+    session._close_audio()
+    assert session._audio_stdin is None, "the write end is released by the teardown"
+
+
+def test_the_camera_audio_reaches_ffmpeg_as_adts(vtm, two_input_ffmpeg, caplog) -> None:
+    """The whole path over the bytes a camera sends: a second payload type carrying an AU header
+    section is detected in the prefix, depacketized, reframed as ADTS and written to the
+    descriptor FFmpeg was handed, while the video keeps going to its own pipe untouched."""
+    caplog.set_level(logging.INFO)
+    ffmpeg_path, video_file, audio_file = two_input_ffmpeg
+    unit = bytes(range(200)) + b"\xaa" * 56
+    vtm(
+        [
+            video(rtp_packet(SPS_PAYLOAD, payload_type=96)),
+            video(audio_packet(unit)),
+            video(audio_packet(unit)),
+        ],
+        silent_after=False,
+    )
+    session = CloudSession(object(), "BB1234567", ffmpeg_path=ffmpeg_path, first_video_timeout=0)
+
+    thread, errors = run_in_thread(session, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert audio_file.read_bytes() == adts_frame(unit) * 2
+    assert video_file.read_bytes() == START_CODE + SPS_PAYLOAD
+    line = next(line for line in _diagnostic_lines(caplog) if " audio:" in line)
+    assert "PT104 aac-hbr config=0x1408" in line
+    assert "AAC-LC, 16000 Hz, mono" in line
+    assert "2 packet(s), 2 AU(s), 0 unreadable" in line
+    assert "first media at +" in line and "(video at +" in line
+
+
+def test_the_window_reads_on_until_a_late_audio_payload_arrives(vtm, two_input_ffmpeg) -> None:
+    """What the window is for: the codec is named in the first packets, the audio starts a few
+    packets later, and the session keeps reading until it does. Reading on is the whole reason
+    an RTP session can carry audio at all -- FFmpeg has to be told about the second input before
+    it starts, and it cannot be told about a stream nobody has seen yet."""
+    ffmpeg_path, _, audio_file = two_input_ffmpeg
+    unit = bytes(range(64))
+    packets = [video(rtp_packet(SPS_PAYLOAD, payload_type=96))]
+    packets += [
+        video(rtp_packet(b"\x41\x9a\x00" + bytes(index), payload_type=96))
+        for index in range(7)
+    ]
+    vtm([*packets, video(audio_packet(unit))], silent_after=False)
+    session = CloudSession(object(), "BB1234567", ffmpeg_path=ffmpeg_path, first_video_timeout=0)
+
+    thread, errors = run_in_thread(session, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert audio_file.read_bytes() == adts_frame(unit)
+
+
+def test_audio_that_starts_past_the_window_is_measured_not_guessed(
+    vtm, two_input_ffmpeg, caplog
+) -> None:
+    """The window is one number, and when it is too short the session has to say what it
+    missed: the time the second payload type's media actually started, beside the window it was
+    given. A stream served without audio and a log that does not explain it is a number nobody
+    can correct -- which is the one thing the local shape of this path has to get right."""
+    caplog.set_level(logging.INFO)
+    ffmpeg_path, _, audio_file = two_input_ffmpeg
+    packets = [video(rtp_packet(SPS_PAYLOAD, payload_type=96))]
+    packets += [
+        video(rtp_packet(b"\x41\x9a\x00" + bytes(index), payload_type=96)) for index in range(10)
+    ]
+    packets.append(video(audio_packet(bytes(range(32)))))
+    made = vtm(packets, stream_class=SlowVtmStream)
+    session = CloudSession(
+        object(),
+        "BB1234567",
+        ffmpeg_path=ffmpeg_path,
+        first_video_timeout=0,
+        audio_window=0.05,
+    )
+
+    thread, errors = run_in_thread(session, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert made["stream"].iterating.wait(SETTLE)
+    assert audio_file.read_bytes() == b"", "the audio was never handed to FFmpeg"
+    line = next(line for line in _diagnostic_lines(caplog) if "carried media, first at" in line)
+    assert "PT104" in line
+    assert "started past the 0.05s audio window" in line
+
+
+def test_a_zero_audio_window_reads_no_further() -> None:
+    """Zero is off, and off has to mean no read as well as no audio: the window is the only
+    thing that makes a session wait for a payload it may never get, so `0` has to remove the
+    wait rather than merely ignore what it finds."""
+    session = CloudSession(object(), "BB1234567", audio_window=0)
+
+    def never_read():
+        raise AssertionError("the session read past the prefix with the window off")
+        yield  # pragma: no cover - makes this a generator
+
+    plan = session._with_audio(_video_plan("h264"), never_read())
+
+    assert plan.audio_payload_type is None
+    assert plan.packets == ()
+
+
+def test_an_mpeg_ps_session_does_not_read_on_for_audio() -> None:
+    """The window belongs to the RTP path. An MPEG-PS session carries whatever it carries and
+    is not made to wait for a second payload type it was never going to be asked about -- the
+    latency is only ever bought where the question can arise, and it is bought before FFmpeg
+    exists, which is what makes it expensive."""
+    session = CloudSession(object(), "BB1234567", audio_window=10.0)
+    stream = BareStream([video(PS_PACKET) for _ in range(20)])
+
+    plan, _ = session._read_prefix(stream)
+
+    assert plan.transport == "MPEG_PS"
+    assert plan.codec is None
+    assert plan.audio_payload_type is None
+    assert len(plan.packets) == session_module._PREFIX_PACKETS
+
+
+def _clocked(clock: list[float], step: float, packets: list[FakePacket]):
+    """Hand packets over while pushing the injected clock forward, so a deadline is reachable."""
+    for packet in packets:
+        clock[0] += step
+        yield packet
+
+
+def test_a_control_packet_cannot_extend_the_audio_window() -> None:
+    """A camera that has stopped sending media still sends keepalives, and every one of them
+    used to skip the deadline -- so the window could not close while control traffic lasted,
+    with the no-video budget already disarmed by the video it had seen and a socket that was
+    never idle long enough to time out. The deadline is checked for every packet now."""
+    clock = [100.0]
+    session = CloudSession(object(), "BB1234567", audio_window=0.5, monotonic=lambda: clock[0])
+    packets = [
+        control(b"keepalive"),
+        control(b"keepalive"),
+        video(rtp_packet(SPS_PAYLOAD, payload_type=96)),
+        video(audio_packet(bytes(8))),
+    ]
+
+    plan = session._with_audio(_video_plan("h264"), _clocked(clock, 0.3, packets))
+
+    assert plan.audio_payload_type is None, "the window closed before the audio was reached"
+    assert plan.packets == (), "a control packet is not a body to replay"
+
+
+def test_a_stalled_audio_input_is_ended_so_the_video_keeps_flowing(monkeypatch) -> None:
+    """FFmpeg reads a packet from every input before it muxes any, so an audio input the camera
+    has stopped feeding is not silence to it: its demuxer thread blocks in `read`, the muxer
+    waits behind that stream and the session produces nothing at all while the camera keeps
+    streaming. A stack sample of the stalled process sits in `read` on the audio descriptor, and
+    the write end being closed is what brings the video back. Hence the guard, and hence the
+    price stated with it: from here on this session has no sound."""
+    monkeypatch.setattr(session_module, "_AUDIO_STALL_POLL", 0.01)
+    clock = [100.0]
+    audio = io.BytesIO()
+    sinks = session_module._Sinks(
+        video=io.BytesIO(),
+        depacketizer=None,
+        audio=audio,
+        audio_depacketizer=AacHbrDepacketizer(payload_type=104),
+        now=lambda: clock[0],
+    )
+    session = CloudSession(object(), "BB1234567", monotonic=lambda: clock[0])
+    stop = threading.Event()
+    watcher = threading.Thread(  # noqa: S101 - the assertions below are the point
+        target=session._watch_audio_stall, args=(sinks, stop), daemon=True
+    )
+    watcher.start()
+    try:
+        time.sleep(0.05)
+        assert sinks.audio is not None, "the clock starts with the input, not at the epoch"
+
+        clock[0] += 1.0
+        time.sleep(0.05)
+        assert sinks.audio is not None, "a second of silence is a pause, not a stall"
+
+        clock[0] += session_module._AUDIO_STALL_SECONDS + 1
+        deadline = time.monotonic() + SETTLE
+        while time.monotonic() < deadline and sinks.audio is not None:
+            time.sleep(0.01)
+    finally:
+        stop.set()
+        watcher.join(timeout=SETTLE)
+
+    assert sinks.audio is None, "the input is given up rather than left to block FFmpeg"
+    assert audio.closed
+    assert sinks.owns_audio(audio_packet(bytes(8))) is False, (
+        "with the input gone its packets belong to the video depacketizer's skip count, as they "
+        "did before this path existed"
+    )
+    assert session._audio_ended_at is not None
+
+
+class BlockedConsumer:
+    """A consumer that stops accepting bytes, which is what a stalled FFmpeg looks like."""
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.released = threading.Event()
+
+    def write(self, chunk: bytes) -> int:
+        self.entered.set()
+        self.released.wait(SETTLE)
+        return len(chunk)
+
+    def flush(self) -> None:
+        return None
+
+
+def test_the_watchdog_gives_the_audio_up_while_the_pump_is_blocked(monkeypatch) -> None:
+    """Why the decision is a thread and not a check in the pump's loop.
+
+    The pump is the thread that would make it, and it is blocked in `stdin.write` by the time
+    the decision is due: FFmpeg stops draining the video pipe as soon as its audio demuxer starts
+    waiting, and a pipe holds well under a second of a 1080p stream -- measured, 1 Mbit/s of
+    video stopped the writer 1.6 s after the audio did. A check between packets would therefore
+    never run, which is exactly the shape the first version of this guard had.
+    """
+    monkeypatch.setattr(session_module, "_AUDIO_STALL_POLL", 0.01)
+    clock = [100.0]
+    audio = io.BytesIO()
+    consumer = BlockedConsumer()
+    sinks = session_module._Sinks(
+        video=consumer,
+        depacketizer=None,
+        audio=audio,
+        audio_depacketizer=AacHbrDepacketizer(payload_type=104),
+        now=lambda: clock[0],
+    )
+    session = CloudSession(object(), "BB1234567", monotonic=lambda: clock[0])
+    stop = threading.Event()
+    watcher = threading.Thread(target=session._watch_audio_stall, args=(sinks, stop), daemon=True)
+    pump = threading.Thread(target=sinks.feed, args=(b"\x41\x9a\x00\x01",), daemon=True)
+    watcher.start()
+    pump.start()
+    try:
+        assert consumer.entered.wait(SETTLE), "the pump never reached the blocked write"
+        clock[0] += session_module._AUDIO_STALL_SECONDS + 1
+        deadline = time.monotonic() + SETTLE
+        while time.monotonic() < deadline and sinks.audio is not None:
+            time.sleep(0.01)
+        assert audio.closed, "the watchdog has to act while the writer cannot"
+    finally:
+        consumer.released.set()
+        stop.set()
+        pump.join(timeout=SETTLE)
+        watcher.join(timeout=SETTLE)

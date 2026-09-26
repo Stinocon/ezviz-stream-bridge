@@ -4,8 +4,8 @@
 
 # EZVIZ Stream Bridge
 
-Serves the video from an EZVIZ camera as MPEG-TS over HTTP, so go2rtc, Frigate, or anything
-else that speaks FFmpeg can use a camera that offers no RTSP.
+Serves the video and audio from an EZVIZ camera as MPEG-TS over HTTP, so go2rtc, Frigate, or
+anything else that speaks FFmpeg can use a camera that offers no RTSP.
 
 This is the source repository. Installed as a Home Assistant add-on from
 **[Stinocon/addons](https://github.com/Stinocon/addons)**.
@@ -113,6 +113,20 @@ This project is the part that has to keep working for weeks unattended:
   that has no container to carry a timestamp. An MPEG-PS stream is untouched: same
   demuxer, byte for byte. The price is up to eight packets of added latency on every
   session, because the decision has to happen before FFmpeg exists.
+- **Audio is depacketized too, when the camera sends it.** A camera that puts its video on
+  RTP puts its sound there as well, under a second payload type — RFC 3640 MPEG4-GENERIC in
+  `AAC-hbr` mode — and the bridge reads that as well as the video. It is the same problem twice:
+  the payload carries no ADTS header, so one is rebuilt from the `AudioSpecificConfig` the
+  camera's own SDP would have carried (AAC-LC, 16 kHz, mono — logged on every session that
+  handles audio, so a camera that differs is visible), and FFmpeg is given a second input for
+  it. The session keeps reading its leading packets for up to `audio_window` seconds (2 by
+  default) to find that payload before FFmpeg starts, because FFmpeg opens its inputs before it
+  reads them and blocks forever on one that never delivers a frame; a camera whose audio starts
+  with its video pays nothing, and `audio_window: 0` turns the audio path off. If the camera's
+  audio then stops mid-session, its input is ended after five seconds of silence so the video
+  keeps flowing — FFmpeg stops muxing altogether on an input with no data in it — which leaves
+  that session without sound. An MPEG-PS session is not affected: it carries its own audio
+  inside the container and waits for nothing.
 - **A stream that produces nothing now says which of the two it is.** A payload that is
   RTP with no H.264 or HEVC parameter set to name it, and packets the depacketizer cannot
   read, are counted and logged rather than left as a bare `bytes=0`. One RTP session can
@@ -121,8 +135,10 @@ This project is the part that has to keep working for weeks unattended:
   also reports what each type carried: how many packets, how many of them held media at all,
   and the size range of those payloads. Up to six types are printed, with a count of any
   beyond that. With the diagnostic on it adds the RTP header and the first bytes of each
-  type's first media packet, which is what names a codec. Audio multiplexed into the same
-  session has to show up here; so does the case where those packets were metadata all along.
+  type's first media packet, which is what names a codec. A second payload type that is not
+  audio is reported rather than dropped in silence: the line says when its media started
+  against the window the session was willing to wait for it, which is the reading that fixes
+  that window when it turns out to be too short.
 - **A remux that produces nothing can be explained, not guessed at.** FFmpeg's stderr is
   discarded by default; with `log_ffmpeg_stderr` (or `--log-ffmpeg-stderr` on the proxy) it is run
   at `info` and its output logged, bounded to 20 lines and then a single suppression notice. It
@@ -164,7 +180,8 @@ ezviz-stream-bridge --options ./options.json --token-file ./ezviz_token.json
   "region": "apiieu.ezvizlife.com",
   "cameras": [{ "serial": "BB1234567", "port": 8558 }],
   "log_level": "info",
-  "log_ffmpeg_stderr": false
+  "log_ffmpeg_stderr": false,
+  "audio_window": 2
 }
 ```
 
@@ -179,7 +196,9 @@ A single camera's proxy can also be run on its own, which is the quickest way to
 connection's lifecycle: `python -m ezviz_stream_bridge.proxy --help`. `--first-video-timeout`
 sets the no-video budget (`0` disables it, restoring the pre-0.1.3 behaviour of waiting
 indefinitely), `--timeout-cooldown` sets how long a new session is withheld after a camera
-timeout (`0` disables it), and `--log-level debug` adds the consumer's request headers to the log.
+timeout (`0` disables it), `--audio-window` sets how long the session reads ahead for the
+camera's audio before starting FFmpeg (`0` serves video only), and `--log-level debug` adds the
+consumer's request headers to the log.
 `--log-ffmpeg-stderr` captures FFmpeg's own diagnostics when a stream produces no output, and with
 it the leading packets of any payload that is not MPEG-PS, and — for a session that carries more
 than one RTP payload type — the first bytes of each type's first media packet, up to six types.
@@ -208,9 +227,11 @@ ruff check .
 
 The RTP path is verified against the FFmpeg the add-on actually runs, not the one on a
 development machine — the image installs Debian's, and a remux that worked on a laptop has
-failed inside the container before. The script builds a synthetic H.264 and HEVC stream,
-packetizes it the way RFC 6184 and RFC 7798 say a camera does, and pushes it through the
-real depacketizer and the real FFmpeg invocation:
+failed inside the container before. The script builds synthetic H.264, HEVC and AAC streams,
+packetizes them the way RFC 6184, RFC 7798 and RFC 3640 say a camera does, runs them through
+the real session — its prefix read, its plan, its argv, both its pipes — and checks what comes
+out: the ADTS rebuilt from the AAC Access Units has to be the ADTS FFmpeg wrote byte for byte,
+and the MPEG-TS has to carry streams that decode.
 
 ```bash
 tools/verify_rtp_against_addon.sh

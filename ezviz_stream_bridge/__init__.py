@@ -1,4 +1,4 @@
-"""EZVIZ Stream Bridge: EZVIZ camera video as local MPEG-TS for go2rtc and Frigate."""
+"""EZVIZ Stream Bridge: EZVIZ camera video and audio as local MPEG-TS for go2rtc."""
 
 from __future__ import annotations
 

@@ -518,6 +518,18 @@ and a fragmented IDR split across FU-A packets. Same cloud, same relay, differen
 so the bridge classifies the leading packets and picks its demuxer from that, rather than
 assuming the one this device happens to use.
 
+The audio on that second device is a finding of its own, contributed by a reporter rather than
+measured here. Its video session carries a second payload type — 104 — whose payload opens
+`00 10 07 20`: an AU-headers-length of 16 bits and one 13-bit size beside a 3-bit index, which
+is RFC 3640 MPEG4-GENERIC in `AAC-hbr` mode, the `mode`/`sizelength`/`indexlength` an EZVIZ or
+Hikvision SDP names. The Access Unit is bare — no ADTS header — so the header is rebuilt from
+the `AudioSpecificConfig` the SDP would have carried (`0x1408`: AAC-LC, 16000 Hz, mono), and a
+second FFmpeg input reads the result. Two independent readings agree on the rate: the sizes and
+the 64 ms cadence (1024 samples at 16 kHz), and the SDP convention of the family. The channel
+count rests on the convention and on the bitrate alone — 228 bytes per 64 ms is about 28 kbit/s,
+where the same audio in stereo would be roughly twice that — so it is logged on every session
+that uses it rather than assumed quietly.
+
 The honest description of the result: **the video bytes come from the cloud, not the LAN.**
 What you gain is the camera in Home Assistant and Frigate without the EZVIZ app. What you do
 not gain is independence from the internet.

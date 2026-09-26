@@ -238,6 +238,11 @@ class Supervisor:
         if self._config.log_ffmpeg_stderr:
             command.append("--log-ffmpeg-stderr")
 
+        # Same rule, and for the same reason: the proxy has the default, and passing it here
+        # would turn the add-on into a second place the number lives.
+        if self._config.audio_window is not None:
+            command += ["--audio-window", f"{self._config.audio_window:g}"]
+
         try:
             # stdout/stderr are inherited so the proxy's own messages land in the
             # add-on log, where the user is already looking, instead of being buffered

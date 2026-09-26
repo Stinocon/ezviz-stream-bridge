@@ -13,7 +13,17 @@ from __future__ import annotations
 import pytest
 
 from ezviz_stream_bridge import rtp as rtp_module
-from ezviz_stream_bridge.rtp import H264, HEVC, RtpDepacketizer, detect_codec
+from ezviz_stream_bridge.rtp import (
+    H264,
+    HEVC,
+    AacHbrDepacketizer,
+    RtpDepacketizer,
+    adts_frame,
+    carries_aac_hbr,
+    describe_config,
+    detect_codec,
+    parse_au_section,
+)
 
 START_CODE = b"\x00\x00\x00\x01"
 
@@ -383,3 +393,134 @@ def test_an_hevc_aggregate_is_split_into_its_nal_units() -> None:
 def test_an_hevc_single_nal_unit_keeps_its_own_two_byte_header() -> None:
     nal = bytes([0x42, 0x01, 0x01, 0x60, 0x00])
     assert RtpDepacketizer(HEVC).feed(rtp_packet(nal)) == START_CODE + nal
+
+
+# -- RFC 3640 audio (MPEG4-GENERIC, AAC-hbr) -------------------------------------------
+
+
+def au_section(units: list[bytes]) -> bytes:
+    """The AU header section an AAC-hbr sender puts in front of these Access Units.
+
+    A 16-bit bit-length, then one 13-bit size beside a 3-bit index per unit, then the units.
+    """
+    headers = b"".join(
+        ((len(unit) << 3) | index).to_bytes(2, "big") for index, unit in enumerate(units)
+    )
+    return (len(headers) * 8).to_bytes(2, "big") + headers + b"".join(units)
+
+
+def test_the_reported_audio_payload_reads_as_one_access_unit() -> None:
+    """The CS-C8c's audio, read the way the family's own SDP says to read it.
+
+    `payload=00 10 07 20 ...`: an AU-headers-length of 16 bits, then one 13-bit size beside a
+    3-bit index -- 0x0720 >> 3 is 228 bytes of Access Unit at index 0, and the media starts at
+    byte 4, which is what a 232-byte payload has left after four bytes of header.
+    """
+    unit = bytes(range(228))
+    payload = bytes.fromhex("00 10 07 20") + unit
+
+    assert parse_au_section(payload) == [unit]
+    assert len(payload) == 4 + 228
+
+
+def test_an_au_section_whose_sizes_do_not_add_up_is_refused() -> None:
+    """The sum is the whole reading. Anything short of an exact fit is a payload that merely
+    starts with two plausible bytes, and framing it would hand FFmpeg an ADTS header describing
+    a frame that is not there."""
+    short = (16).to_bytes(2, "big") + (228 << 3).to_bytes(2, "big") + bytes(227)
+
+    assert parse_au_section(short) is None
+    assert parse_au_section(short + b"\x00") == [bytes(228)], "one byte more and it fits"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"",  # nothing at all
+        b"\x00",  # half a length field
+        b"\x00\x08" + bytes(32),  # 8 bits of AU header is not a whole one of these
+        b"\x00\x10" + bytes(4),  # the section runs past the end of the payload
+        b"\x00\x10\x00\x00",  # a zero-sized Access Unit
+        b"\x00\xff\xff\xff\xff",  # a section far longer than any payload
+    ],
+)
+def test_a_payload_that_is_not_an_au_section_is_refused(payload: bytes) -> None:
+    assert parse_au_section(payload) is None
+
+
+def test_a_multi_au_packet_yields_its_units_in_order() -> None:
+    units = [bytes([1]) * 7, bytes([2]) * 9, bytes([3]) * 11]
+    assert parse_au_section(au_section(units)) == units
+
+
+def test_the_adts_header_is_the_one_ffmpeg_writes() -> None:
+    """Observed, not built twice: for a 512-byte Access Unit at this config, FFmpeg's own ADTS
+    writer emits `ff f1 60 40 40 ff fc`. Rebuilding it has to land on those seven bytes, or the
+    rebuild is a second opinion about a format that already has one."""
+    unit = bytes(512)
+
+    frame = adts_frame(unit)
+
+    assert frame[:7] == bytes.fromhex("ff f1 60 40 40 ff fc")
+    assert frame[7:] == unit
+
+
+def test_an_access_unit_too_large_for_adts_is_not_framable() -> None:
+    """The header's length field is thirteen bits wide. Past that there is no frame to build,
+    and the difference between "not audio" and "audio this cannot describe" has to be known
+    before a second FFmpeg input is started on it: an input that never delivers a frame is one
+    FFmpeg blocks on, so a session primed with nothing never starts."""
+    assert carries_aac_hbr(au_section([bytes(8184)])) is True
+    assert carries_aac_hbr(au_section([bytes(8185)])) is False
+
+
+def test_the_audio_depacketizer_reframes_a_packet_the_way_the_camera_sent_it() -> None:
+    """One packet end to end: RTP header, AU header section, Access Unit in, ADTS frame out --
+    the seven bytes FFmpeg's own writer produces for the same config, in front of the same
+    bytes, with the four bytes of section removed."""
+    unit = bytes(range(256)) * 2
+    depacketizer = AacHbrDepacketizer(payload_type=104)
+
+    frames = depacketizer.feed(rtp_packet(au_section([unit]), payload_type=104))
+
+    assert frames == adts_frame(unit)
+    assert frames[7:] == unit
+    assert (depacketizer.packets, depacketizer.aus, depacketizer.dropped) == (1, 1, 0)
+
+
+def test_the_audio_depacketizer_counts_what_it_cannot_read() -> None:
+    """Two different faults and two counters: a packet of another payload type is not this
+    stream at all, and a payload that is not an AU header section is this bridge reading the
+    format wrong. A session reporting zero of either is the evidence that it read it right,
+    which is why both are numbers rather than silence."""
+    depacketizer = AacHbrDepacketizer(payload_type=104)
+
+    assert depacketizer.feed(rtp_packet(au_section([b"\x01" * 8]), payload_type=96)) == b""
+    assert depacketizer.feed(rtp_packet(b"\xff\xf1\x50\x80\x00", payload_type=104)) == b""
+    assert depacketizer.feed(rtp_packet(b"", payload_type=104)) == b"", "no payload, no fault"
+    assert (depacketizer.skipped, depacketizer.dropped) == (1, 1)
+
+
+def test_a_video_payload_is_not_read_as_audio() -> None:
+    """The reading doubles as the detection, so it has to be a reading of audio rather than of
+    whatever a video payload happens to look like. These are the three leading payloads of the
+    reported session, and none of them is an AU header section."""
+    for packet in (H264_SPS, H264_PPS, H264_IDR_START):
+        assert parse_au_section(packet[12:]) is None, packet[12:20].hex(" ")
+
+
+def test_a_config_adts_cannot_describe_is_refused() -> None:
+    """AOT 5 is SBR and the two profile bits cannot hold it. Refusing is the point: framing it
+    anyway would describe a stream a decoder would then read as something else entirely."""
+    with pytest.raises(ValueError, match="not an ADTS profile"):
+        AacHbrDepacketizer(config=0x2C08)
+
+
+def test_describe_config_spells_out_the_family_default() -> None:
+    """The one parameter of the audio path that is not in the payload, printed so it can be
+    argued with: this is the value Hikvision and EZVIZ RTSP SDPs carry, and a camera that
+    differs is meant to be visible in the log rather than audible on the speaker."""
+    assert describe_config() == "AAC-LC, 16000 Hz, mono"
+    assert describe_config(0x1210) == "AAC-LC, 44100 Hz, 2 channels"
+    assert describe_config(0x1408) == describe_config()
+    assert "reserved" in describe_config(0x1688)
