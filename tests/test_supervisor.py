@@ -7,6 +7,8 @@ clean slate. None of these tests sleep -- the clock is injected.
 
 from __future__ import annotations
 
+import logging
+from importlib import metadata
 from pathlib import Path
 
 import pytest
@@ -84,6 +86,12 @@ class _FakeProcess:
     def poll(self) -> int | None:
         return None
 
+    def terminate(self) -> None:
+        return None
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
 
 def _supervisor(
     *, log_ffmpeg_stderr: bool = False, audio_window: float | None = None
@@ -139,3 +147,29 @@ def test_the_audio_window_reaches_the_proxy_only_when_it_is_set(
     passed._start(passed._proxies[0])
     command = captured["command"]
     assert command[command.index("--audio-window") + 1] == "1.5"
+
+def test_startup_says_which_version_is_running(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The one line an operator needs when comparing a log with a release: its version.
+
+    A log that cannot name the build it came from sends a diagnosis down the wrong
+    path, and it already has: a reporter updated, attached a log, and the log did not
+    say which version they were running. The line reads the installed package's
+    metadata, so it stays right without a second place to keep the number in.
+    """
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(supervisor_module.subprocess, "Popen", lambda command: _FakeProcess())
+
+    supervisor = _supervisor()
+
+    def stop_after_the_first_pass(_seconds: float) -> None:
+        supervisor._stopping = True
+
+    monkeypatch.setattr(supervisor_module.time, "sleep", stop_after_the_first_pass)
+    code = supervisor.run()
+
+    assert code == 0
+    lines = [record.getMessage() for record in caplog.records]
+    expected = f"ezviz-stream-bridge {metadata.version('ezviz-stream-bridge')}"
+    assert expected in lines, lines[:4]

@@ -197,6 +197,10 @@ This project is the part that has to keep working for weeks unattended:
   the millisecond, and each session reports `session opened`, `first-video` (the camera starting
   to send) and `first-byte` (the consumer starting to receive), so a wake-up can be measured
   against Frigate, go2rtc and Home Assistant rather than guessed at.
+- **A log that names the build it came from.** The first line of the bridge's own log is its
+  version, read from the installed package's metadata — the same number the store shows, with
+  one home and no way to drift. A log without it invites guessing which release it is running,
+  and a wrong guess there sends the whole diagnosis down the wrong path.
 - **Session handling in one place.** The token is verified before every proxy start and renewed
   when the cloud stops accepting it. It is kept on `/data`, because a fresh login on every
   start is a login EZVIZ counts and rate-limits.

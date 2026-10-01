@@ -17,12 +17,28 @@ import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from importlib import metadata
 from types import FrameType
 
 from .config import BridgeConfig, CameraConfig
 from .token import MfaRequiredError, TokenStore
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def version() -> str:
+    """The version of the running package, read from the metadata it was installed with.
+
+    One home for the number -- pyproject, through the built wheel -- and a log that says
+    it first thing, because a log that cannot name its build sends a diagnosis down the
+    wrong path. A source checkout without the package installed gets `unknown`, which is
+    still an answer.
+    """
+    try:
+        return metadata.version("ezviz-stream-bridge")
+    except metadata.PackageNotFoundError:  # pragma: no cover - the add-on image installs it
+        return "unknown"
+
 
 # Backoff between restarts of the same camera, in seconds.
 FIRST_BACKOFF = 5.0
@@ -89,6 +105,12 @@ class Supervisor:
     def run(self) -> int:
         """Supervise until a signal asks for shutdown. Returns a process exit code."""
         self._install_signal_handlers()
+
+        # The version first, because a log that cannot name the build it came from sends
+        # a diagnosis down the wrong path: an operator comparing a log against a release
+        # ends up guessing, and the guess has been wrong once already. It is read from the
+        # installed package's metadata, so the number has one home and this cannot drift.
+        _LOGGER.info("ezviz-stream-bridge %s", version())
 
         # A consumer reaches the stream at the Home Assistant host IP on the port the
         # add-on publishes in its Network tab -- NOT at an add-on hostname. An earlier
