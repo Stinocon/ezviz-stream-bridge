@@ -113,6 +113,20 @@ This project is the part that has to keep working for weeks unattended:
   that has no container to carry a timestamp. An MPEG-PS stream is untouched: same
   demuxer, byte for byte. The price is up to eight packets of added latency on every
   session, because the decision has to happen before FFmpeg exists.
+- **A connection that joins the stream mid-GOP gets the parameter sets it arrived without.**
+  A camera keeps one encoder timeline across sessions, so a second connection — the one a
+  player opens beside the first — attaches between keyframes and receives slices only: the
+  parameter sets belong to the keyframe the stream opened with, not to the session, and a
+  battery camera's keyframe interval is longer than any client waits. Such a join used to
+  open FFmpeg's `mpeg` demuxer and produce nothing at all, `bytes=0`, until the client gave
+  up on it. Now the session that opens the stream leaves its parameter sets in a per-camera
+  cache, and a join whose leading packets carry none is served from it: the sets go ahead of
+  its slices, FFmpeg reads the codec the stream actually is, and the picture is clean from
+  the next keyframe on — the artifacts until then are the join's own failure mode, not the
+  mute or the black it used to be. A join against a cold cache — no session of that camera
+  has opened a stream yet — keeps the old behaviour and says so, and the cache never
+  expires: a camera does not change its parameter sets between sessions of the same
+  stream, and the next one that opens a stream overwrites whatever it holds.
 - **Audio is depacketized too, when the camera sends it.** A camera that puts its video on RTP
   puts its sound there as well, under a second payload type: RFC 3640 MPEG4-GENERIC in `AAC-hbr`
   mode. It is the same problem twice. The payload carries no ADTS header, so one is rebuilt from

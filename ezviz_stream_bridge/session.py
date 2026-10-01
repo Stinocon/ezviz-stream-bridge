@@ -45,6 +45,7 @@ from .rtp import (
     carries_aac_hbr,
     describe_config,
     detect_codec,
+    parameter_sets,
     parse_au_section,
     set_channels,
     stream_channels,
@@ -94,6 +95,12 @@ _AUDIO_PENDING_BYTES = 256 * 1024
 # consumer further behind than this is not slow but stalled: the oldest chunks are dropped and
 # counted, because a queue this deep is already most of a minute of video.
 _VIDEO_PENDING_BYTES = 8 * 1024 * 1024
+
+# The parameter sets a camera's stream opened with, kept per serial for the sessions that join
+# the same stream mid-GOP and get none of their own. One entry per camera, overwritten every
+# time a session opens a stream, guarded because one camera can serve several sessions at once.
+_PARAMETER_SETS: dict[str, tuple[str, int, bytes]] = {}
+_PARAMETER_SETS_LOCK = threading.Lock()
 
 # Fewer packets than this and an interval says nothing: it would be one measurement with no way
 # to tell a real cadence from the gap before the camera started talking. The same is true of a
@@ -670,6 +677,10 @@ class _PayloadPlan:
     # this session will use, and the report says so rather than letting the log imply a reading
     # that was never taken. The sample rate has no such field at all -- see `_audio_config`.
     audio_channels: int | None = None
+    # The parameter sets an earlier session of this camera opened with, ahead of a join that
+    # has none of its own. Empty on every session whose prefix carries them (the stream is
+    # already open) and on every join against a cold cache: there is nothing to hand over.
+    parameter_prelude: bytes = b""
 
 
 @dataclass
@@ -1194,12 +1205,18 @@ class CloudSession:
         told which elementary stream it is getting -- and which one that is comes from the
         parameter set the stream opens with, never from a guess about the framing.
 
-        RTP with no parameter set in the leading packets stays on the `mpeg` demuxer, which is
-        what the bridge did before this path existed: FFmpeg will produce nothing from it, but
-        the warning says so plainly, and a session is not refused over a payload the bridge
-        merely failed to recognise. The transport can be read wrong in one direction -- a first
-        byte carrying RTP's version bits is not rare -- and refusing to serve a stream that
-        would have worked is worse than serving one that produces nothing.
+        RTP with no parameter set in the leading packets is a join against a stream that is
+        already in flight, which no longer sends one: this camera keeps one encoder timeline
+        across sessions, and the parameter sets belong to the keyframe the stream opened with,
+        not to the session. The sets another session of the same camera opened with are
+        written ahead of such a join, so FFmpeg reads a stream from the first decodable frame
+        -- and the cache it needs is filled by the session that opened the stream, which by
+        definition has them. With nothing cached the join stays on the `mpeg` demuxer, which
+        is what the bridge did before this path existed: FFmpeg will produce nothing from it,
+        but the warning says so plainly, and a session is not refused over a payload the
+        bridge merely failed to recognise. The transport can be read wrong in one direction
+        -- a first byte carrying RTP's version bits is not rare -- and refusing to serve a
+        stream that would have worked is worse than serving one that produces nothing.
         """
         data = b"".join(packets)
         transport = classify_payload(data)[0] if data else "UNKNOWN"
@@ -1213,7 +1230,11 @@ class CloudSession:
             if codec is not None:
                 payload_type = _payload_type_of(body)
                 break
-        if codec is None:
+        if codec is not None:
+            self._remember_parameter_sets(packets, codec, payload_type)
+            return _PayloadPlan(transport, codec, codec, payload_type, packets)
+        cached = self._cached_parameter_sets()
+        if cached is None:
             _LOGGER.warning(
                 "[FFmpeg] %spayload transport=RTP but none of the first %d video packets "
                 "carries an H.264 or HEVC parameter set; leaving it to FFmpeg's `%s` demuxer, "
@@ -1223,7 +1244,45 @@ class CloudSession:
                 _MPEG_PS_DEMUXER,
             )
             return _PayloadPlan(transport, _MPEG_PS_DEMUXER, None, None, packets)
-        return _PayloadPlan(transport, codec, codec, payload_type, packets)
+        cached_codec, cached_payload_type, prelude = cached
+        _LOGGER.info(
+            "[FFmpeg] %snone of the first %d video packets carries a parameter set: this "
+            "stream joined one already in flight, so the video opens on the sets an "
+            "earlier session of this camera cached, and the picture is clean from the "
+            "next keyframe on",
+            self._label(),
+            len(packets),
+        )
+        return _PayloadPlan(
+            transport, cached_codec, cached_codec, cached_payload_type, packets,
+            parameter_prelude=prelude,
+        )
+
+    def _remember_parameter_sets(
+        self, packets: tuple[bytes, ...], codec: str, payload_type: int | None
+    ) -> None:
+        """Keep the parameter sets this stream opened with, per camera, for the next join.
+
+        The cache is the whole fix: a camera whose stream is already in flight does not send
+        them to a session that joins mid-GOP, and the join is served from here. It is per
+        serial, process-wide, and never expires -- a camera does not change its parameter
+        sets between sessions of the same stream, and the next session that opens one
+        overwrites whatever this holds. Stale sets would decode as artifacts until the next
+        keyframe, which is the join's own failure mode and better than thirty seconds of
+        nothing.
+        """
+        if payload_type is None:
+            return
+        prelude = parameter_sets(packets, codec, payload_type)
+        if not prelude:
+            return
+        with _PARAMETER_SETS_LOCK:
+            _PARAMETER_SETS[self._serial] = (codec, payload_type, prelude)
+
+    def _cached_parameter_sets(self) -> tuple[str, int, bytes] | None:
+        """What an earlier session of this camera opened with, when there is any."""
+        with _PARAMETER_SETS_LOCK:
+            return _PARAMETER_SETS.get(self._serial)
 
     def _accept(self, packet: Any) -> bytes | None:
         """Check one VTM packet, and return its body when it is video.
@@ -1538,7 +1597,13 @@ class CloudSession:
         before anything can fill the video pipe -- see the pump -- and because doing that here,
         once, keeps the two passes from being two loops that quietly disagree about which
         packet belongs to which half.
+
+        A join whose packets carry no parameter sets opens on the cached ones, written before
+        the replay and for the same reason the replay exists: FFmpeg's probe reads what is at
+        the head of its stdin, and a probe that finds slices with no sets names no codec.
         """
+        if audio is not False and plan.parameter_prelude:
+            sinks.video.write(plan.parameter_prelude)
         for body in plan.packets:
             owns = sinks.owns_audio(body)
             if audio is None or owns == audio:

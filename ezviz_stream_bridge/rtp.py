@@ -26,6 +26,7 @@ depacketizer cannot make sense of has to be visible as a number, not as silence.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from pyezvizapi.exceptions import PyEzvizError
@@ -41,6 +42,7 @@ _START_CODE = b"\x00\x00\x00\x01"
 
 # H.264 NAL unit types (RFC 6184 table 1).
 _H264_SPS = 7
+_H264_PPS = 8
 _H264_STAP_A = 24
 _H264_FU_A = 28
 
@@ -265,6 +267,66 @@ def detect_codec(payload: bytes) -> str | None:
     if first == (_HEVC_AP << 1):
         return _aggregated_codec(payload, offset=2, codec=HEVC)
     return None
+
+
+def parameter_sets(packets: Sequence[bytes], codec: str, payload_type: int) -> bytes:
+    """The parameter-set NAL units an RTP prefix carries, as an Annex-B prelude.
+
+    A connection that opens the camera's stream gets them in its leading packets; a
+    connection that joins a stream already in flight does not, for as long as the camera's
+    keyframe interval. The prelude this returns is what lets the bridge hand FFmpeg the sets
+    anyway: written ahead of the join's own slices, they open the stream from the next
+    decodable frame instead of never.
+
+    The depacketizer does the unwrapping -- padding, extensions, fragments, aggregates --
+    and the scan runs on the Annex-B it emits, so every unit is judged whole. Only the
+    prefix's own codec is read: the SPS or VPS that named it was already checked the strict
+    way `detect_codec` checks, and within one named codec a parameter set's type cannot be
+    anything else, which is the whole difference from the collision rules a first reading
+    needs.
+    """
+    depacketizer = RtpDepacketizer(codec, payload_type=payload_type)
+    stream = bytearray()
+    for packet in packets:
+        chunk = depacketizer.feed(packet)
+        if chunk:
+            stream += chunk
+    depacketizer.flush()
+    prelude = bytearray()
+    rest = bytes(stream)
+    while (unit := _annex_b_head(rest)) is not None:
+        if _is_parameter_set(unit, codec):
+            prelude += _START_CODE
+            prelude += unit
+        rest = rest[rest.find(_START_CODE) + len(unit) + len(_START_CODE) :]
+    return bytes(prelude)
+
+
+def _annex_b_head(stream: bytes) -> bytes | None:
+    """The first NAL unit of an Annex-B stream, or None when the stream holds none."""
+    start = stream.find(_START_CODE)
+    if start < 0:
+        return None
+    body = stream[start + len(_START_CODE) :]
+    end = body.find(_START_CODE)
+    return body if end < 0 else body[:end]
+
+
+def _is_parameter_set(unit: bytes, codec: str) -> bool:
+    """One Annex-B NAL unit, judged as a parameter set of the codec already named."""
+    if not unit:
+        return False
+    if codec == H264:
+        return unit[0] & 0x1F in (_H264_SPS, _H264_PPS)
+    if len(unit) < _HEVC_NAL_HEADER:
+        return False
+    first, second = unit[0], unit[1]
+    return (
+        not first & 0x80
+        and (first >> 1) & 0x3F in (_HEVC_VPS, _HEVC_SPS, _HEVC_PPS)
+        and not first & 0x01
+        and second & 0x07 != 0
+    )
 
 
 class RtpDepacketizer:

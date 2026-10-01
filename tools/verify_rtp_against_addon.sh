@@ -10,7 +10,9 @@
 #
 # The audio leg is checked twice over: the ADTS rebuilt from the Access Units has to be the ADTS
 # FFmpeg wrote in the first place, byte for byte, and the MPEG-TS out of the session has to
-# carry an audio stream that decodes.
+# carry an audio stream that decodes. The join leg runs a second session against the same
+# camera, mid-GOP, and its output has to open as the codec the stream is and decode the
+# keyframe the camera sends next.
 #
 # Needs docker and network access -- the image installs ffmpeg and pyezvizapi on the way.
 # Override the base image with EZVIZ_VERIFY_IMAGE if the add-on's Dockerfile moves on.
@@ -472,6 +474,43 @@ def probe_audio_stall(video_source_argv: list[str], audio_source_argv: list[str]
     assert "h264" in found, f"the recovered stream carries {found!r}"
 
 
+def probe_mid_gop_join(source_argv: list[str]) -> None:
+    """A connection that joins the camera's stream mid-GOP: it has no parameter set of its own.
+
+    A camera keeps one encoder timeline across sessions, so a second connection -- the one a
+    player opens beside the first -- attaches between keyframes and gets slices only, for
+    longer than any client waits. Every such join used to open the `mpeg` demuxer and produce
+    nothing at all (`bytes=0`). The bridge now serves the join from the parameter sets an
+    earlier session cached, and this is the leg that proves it against the ffmpeg the add-on
+    installs: the stream has to open as the codec it is, and the keyframe the camera sends
+    next has to decode.
+    """
+    source = subprocess.run(source_argv, capture_output=True, check=True).stdout
+    nals = split_annexb(source)
+    head = nals[: next(index for index, nal in enumerate(nals) if nal[0] & 0x1F == 1)]
+    assert len(head) >= 2, "the synthetic stream opened with no keyframe material"
+    run_session(video_packets(H264, source))  # the session that opened the stream: it fills the cache
+
+    # The join: slices only, and the camera's next keyframe at the end of it -- the same sets,
+    # sent again the way a camera sends them with every IDR.
+    timeline = [nal for nal in nals if nal not in head] + head
+    join = video_packets(H264, b"".join(b"\x00\x00\x00\x01" + nal for nal in timeline))
+    remuxed, lines = run_session(join)
+
+    assert any("an earlier session of this camera cached" in line for line in lines), (
+        f"the join was never served from the cache: {lines[-3:]}"
+    )
+    assert not any("leaving it to FFmpeg's `mpeg` demuxer" in line for line in lines)
+    found = " ".join(sorted(set(ffprobe(remuxed, "stream=codec_name").split())))
+    frames = decodes(remuxed, H264)
+    print(
+        f"mid-GOP join: {len(join)} RTP packet(s) -> {len(remuxed)} B MPEG-TS, "
+        f"ffprobe {found!r}, {frames} frame(s) decoded"
+    )
+    assert found == H264, f"the join carries {found!r}"
+    assert remuxed, "the join produced no MPEG-TS"
+
+
 def main() -> int:
     version = subprocess.run(
         ["ffmpeg", "-hide_banner", "-version"], capture_output=True, check=True
@@ -503,6 +542,7 @@ def main() -> int:
          "-pix_fmt", "yuv420p", "-c:v", "libx264", "-b:v", "800k", "-f", "h264", "pipe:1"],
         audio,
     )
+    probe_mid_gop_join(h264)
     print("VERIFICATION OK")
     return 0
 

@@ -37,6 +37,19 @@ TEARDOWN_LIMIT = 5.0
 SETTLE = 2.0
 
 
+@pytest.fixture(autouse=True)
+def _clear_parameter_sets() -> None:
+    """The bridge caches the parameter sets it sees, per camera, across sessions.
+
+    Every test therefore starts from an empty cache: the cache is what a second session of
+    the same camera reads, and a test would otherwise depend on whichever test ran before
+    it and warmed it.
+    """
+    session_module._PARAMETER_SETS.clear()
+    yield
+    session_module._PARAMETER_SETS.clear()
+
+
 @dataclass
 class FakePacket:
     """The parts of a VtmPacket this code depends on."""
@@ -979,6 +992,58 @@ def test_packet_dump_explains_a_packet_whose_extension_overruns_it(
     )
     assert any("carries an H.264 or HEVC parameter set" in message for message in messages)
     assert any("leaving it to FFmpeg's `mpeg` demuxer" in message for message in messages)
+
+
+def test_a_mid_gop_join_serves_the_parameter_sets_cached_by_an_earlier_session(
+    vtm, two_input_ffmpeg, caplog
+) -> None:
+    """The black-screen attempts of issue #1, end to end.
+
+    A second connection opens a new VTM session on a camera whose stream is already in
+    flight, and joins it mid-GOP: slices, no parameter set of its own, for as long as the
+    camera's keyframe interval -- which on a battery camera is longer than any client
+    waits. Every such join produced nothing at all (`bytes=0`, the warning about the mpeg
+    demuxer) until it was closed. The bridge keeps the parameter sets a fresh session
+    opens with, per camera, and writes them ahead of a join that arrived without its own:
+    the stream opens on the cached sets and is clean from the next keyframe.
+    """
+    caplog.set_level(logging.INFO)
+    ffmpeg_path, video_file, _ = two_input_ffmpeg
+    pps = b"\x68\xee\x38\x80"
+    vtm(
+        [
+            video(rtp_packet(SPS_PAYLOAD, payload_type=96)),
+            video(rtp_packet(pps, payload_type=96)),
+            video(rtp_packet(b"\x65\x88\x84\x21" + bytes(range(64)), payload_type=96)),
+        ],
+        silent_after=False,
+    )
+    first = CloudSession(object(), "JG1234567", ffmpeg_path=ffmpeg_path, first_video_timeout=0)
+    thread, errors = run_in_thread(first, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+    assert not thread.is_alive()
+    assert errors == []
+
+    vtm(
+        [
+            video(rtp_packet(b"\x41\x9a\x00" + bytes([index]), payload_type=96))
+            for index in range(8)
+        ],
+        silent_after=False,
+    )
+    second = CloudSession(object(), "JG1234567", ffmpeg_path=ffmpeg_path, first_video_timeout=0)
+    thread, errors = run_in_thread(second, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert not thread.is_alive()
+    assert errors == []
+    served = video_file.read_bytes()
+    assert served.startswith(
+        START_CODE + SPS_PAYLOAD + START_CODE + pps + START_CODE + b"\x41\x9a\x00\x00"
+    ), "the cached sets go ahead of the join's own slices"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("an earlier session of this camera cached" in message for message in messages)
+    assert not any("leaving it to FFmpeg's `mpeg` demuxer" in message for message in messages)
 
 
 def test_a_metadata_packet_does_not_count_as_the_first_video(vtm, fake_ffmpeg) -> None:
