@@ -1456,6 +1456,125 @@ def test_the_camera_audio_reaches_ffmpeg_as_adts(vtm, two_input_ffmpeg, caplog) 
     assert "first media at +" in line and "(video at +" in line
 
 
+@pytest.fixture
+def jamming_ffmpeg(tmp_path: Path) -> tuple[str, Path]:
+    """A remux that drains its extra (audio) descriptors but never reads its video stdin.
+
+    This is the shape the real FFmpeg takes while its interleaver waits for the audio: the
+    audio input's wallclock begins after the video's probe, so the muxer keeps asking for
+    the next audio packet before it drains the video, and once the OS stdin is full a pump
+    written to a blocking stdin is a pump that can no longer feed the audio pipe -- the
+    deadlock that muted the reporter's sessions, broken only by the stall watchdog, five
+    seconds after the last audio packet. `cat` cannot stand in for it: it drains both pipes;
+    this one jams the video on purpose.
+    """
+    script = tmp_path / "jamming-ffmpeg"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "extra = [\n"
+        "    int(arg.split(':')[1])\n"
+        "    for arg in sys.argv[1:]\n"
+        "    if arg.startswith('pipe:') and arg not in ('pipe:0', 'pipe:1')\n"
+        "]\n"
+        "audio = b''\n"
+        "for fd in extra:\n"
+        "    while True:\n"
+        "        chunk = os.read(fd, 65536)\n"
+        "        if not chunk:\n"
+        "            break\n"
+        "        audio += chunk\n"
+        "with open(sys.argv[0] + '.audio', 'wb') as handle:\n"
+        "    handle.write(audio)\n"
+    )
+    script.chmod(0o755)
+    return str(script), Path(f"{script}.audio")
+
+
+def test_a_full_video_stdin_must_not_starve_the_audio_pipe(vtm, jamming_ffmpeg, caplog) -> None:
+    """The 0.1.13 deadlock, end to end.
+
+    FFmpeg probes the video input before it opens the audio one, so the audio's wallclock
+    starts late and the interleaver asks for the next audio packet before it drains the
+    video: the video stdin fills up, the single pump thread parks writing it, the audio
+    pipe runs dry, and FFmpeg waits on the empty pipe -- a cycle only the stall watchdog
+    can break, and it breaks it by ending the audio, which is the muted session the
+    reporter saw. The stdin write must never park the pump: the video to FFmpeg goes
+    through the same bounded, non-blocking queue as the audio, and a jammed stdin
+    degrades to counted drops instead of a mute.
+    """
+    caplog.set_level(logging.INFO)
+    ffmpeg_path, audio_file = jamming_ffmpeg
+    unit = bytes(range(200)) + b"\xaa" * 56
+    # enough video to fill the OS stdin (~64 KiB) several times over: a blocking write
+    # parks the pump before half the audio has been served, and the audio packets behind
+    # the parked write never reach the pipe the jammed remux is reading
+    packets = [video(rtp_packet(SPS_PAYLOAD, payload_type=96))]
+    for index in range(90):
+        packets.append(
+            video(rtp_packet(b"\x41\x9a\x00" + bytes([index]) + b"\xaa" * 1090, payload_type=96))
+        )
+        if index % 2 == 0:
+            packets.append(video(audio_packet(unit + bytes([index]))))
+    vtm(packets, silent_after=False)
+    session = CloudSession(object(), "BB1234567", ffmpeg_path=ffmpeg_path, first_video_timeout=0)
+
+    thread, errors = run_in_thread(session, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert not thread.is_alive(), (
+        "the pump is parked writing the full stdin; the session cannot end"
+    )
+    assert errors == []
+    served = audio_file.read_bytes()
+    assert served == b"".join(
+        adts_frame(unit + bytes([index])) for index in range(0, 90, 2)
+    ), "every AU has to reach the pipe even while the video stdin is jammed"
+    assert not [line for line in _diagnostic_lines(caplog) if "nothing from the camera" in line]
+
+
+def test_video_over_the_queue_bound_drops_the_oldest_and_says_so(
+    vtm, jamming_ffmpeg, caplog, monkeypatch
+) -> None:
+    """The bound is a degradation, and a degradation nobody can see is a bug.
+
+    A stdin this far behind is a stalled consumer, and the queue cannot hold the camera's
+    video forever: the oldest chunks are dropped -- whole, never split -- and the session
+    says how many. The audio is the other half of the contract: its packets sit in the
+    stream behind the video ones, so they must keep flowing while the video is being
+    dropped.
+    """
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setattr(session_module, "_VIDEO_PENDING_BYTES", 64 * 1024)
+    ffmpeg_path, audio_file = jamming_ffmpeg
+    unit = bytes(range(200)) + b"\xaa" * 56
+    packets = [video(rtp_packet(SPS_PAYLOAD, payload_type=96))]
+    for index in range(90):
+        packets.append(
+            video(rtp_packet(b"\x41\x9a\x00" + bytes([index]) + b"\xaa" * 1090, payload_type=96))
+        )
+        if index % 2 == 0:
+            packets.append(video(audio_packet(unit + bytes([index]))))
+    vtm(packets, silent_after=False)
+    session = CloudSession(object(), "BB1234567", ffmpeg_path=ffmpeg_path, first_video_timeout=0)
+
+    thread, errors = run_in_thread(session, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert not thread.is_alive()
+    assert errors == []
+    served = audio_file.read_bytes()
+    assert served == b"".join(
+        adts_frame(unit + bytes([index])) for index in range(0, 90, 2)
+    ), "the audio keeps flowing while the video queue is dropping"
+    line = next(
+        line for line in _diagnostic_lines(caplog) if "never reached FFmpeg" in line
+    )
+    assert "dropped" in line and "chunks" in line
+
+
 def test_the_window_reads_on_until_a_late_audio_payload_arrives(vtm, two_input_ffmpeg) -> None:
     """What the window is for: the codec is named in the first packets, the audio starts a few
     packets later, and the session keeps reading until it does. Reading on is the whole reason

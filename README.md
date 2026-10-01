@@ -137,6 +137,23 @@ This project is the part that has to keep working for weeks unattended:
   session has no sound, and audio the sink could not hand over is counted and warned about rather
   than lost quietly. An MPEG-PS session is unaffected: it carries its own audio inside the
   container and waits for nothing.
+- **The video also waits in a bounded queue, because with two inputs FFmpeg does not drain the
+  video while it waits for the audio.** FFmpeg probes the video input before it opens the audio
+  one, and its interleaver reads the video no further ahead than the audio's timestamps: for the
+  whole session the video is read with a delay, and a blocking stdin holds less than a second
+  of it. A parked video write parks the only thread that feeds the audio pipe too, and the cycle
+  that follows — the pipe empty, FFmpeg waiting on it, the stdin full, the pump parked — is the
+  deadlock that muted sessions whose camera was sending audio the whole time; until 0.1.14 the
+  stall watchdog broke it by ending the audio, five seconds after the last packet it served.
+  Now the video goes through the same kind of bounded queue as the audio: the write cannot park,
+  the queue holds more than a probe's worth of a camera's stream, and a stdin that stays jammed
+  past the bound drops the oldest chunks — counted, and warned about — rather than parking the
+  audio with it. The audio, in turn, keeps the clock of its own demuxer rather than the read
+  time: the pipe is read in bursts once the video's probe is over, and a read time would stamp
+  seconds of audio into one instant. Its timeline is placed against the video's by the gap this
+  session measured between its first audio packet and its first video one. A session without
+  audio keeps its blocking stdin: one input has no interleaver, and backpressure that reaches
+  the camera is the behaviour a single stream wants.
 - **A stream that produces nothing now says which of the two it is.** A payload that is
   RTP with no H.264 or HEVC parameter set to name it, and packets the depacketizer cannot
   read, are counted and logged rather than left as a bare `bytes=0`. One RTP session can

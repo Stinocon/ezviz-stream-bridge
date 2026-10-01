@@ -87,6 +87,14 @@ _AUDIO_WINDOW_BYTES = 4 * 1024 * 1024
 # audio is about 200 KiB.
 _AUDIO_PENDING_BYTES = 256 * 1024
 
+# How much video the stdin queue holds for FFmpeg. Its probe of the video input runs before it
+# opens the audio one, and the interleaver will not drain the video past the audio's timestamps:
+# the whole probe's worth of video has to wait, and a 1080p camera sends 150-500 KiB/s -- so the
+# bound that absorbs one probe plus one slow start is a few MiB, not the 64 KiB of the pipe. A
+# consumer further behind than this is not slow but stalled: the oldest chunks are dropped and
+# counted, because a queue this deep is already most of a minute of video.
+_VIDEO_PENDING_BYTES = 8 * 1024 * 1024
+
 # Fewer packets than this and an interval says nothing: it would be one measurement with no way
 # to tell a real cadence from the gap before the camera started talking. The same is true of a
 # span this short -- packets handed over in one burst have an interval, but it is not a cadence.
@@ -443,6 +451,82 @@ class _AudioPipe:
             self._pending.popleft()
 
 
+class _VideoPipe:
+    """The video's write end of FFmpeg's stdin: a bounded queue that cannot park the pump.
+
+    FFmpeg probes the video input before it opens the audio one, and its interleaver will not
+    drain the video past the audio's timestamps: from the first audio packet to the end of the
+    session, the video is always read with a delay. A blocking stdin holds less than a second
+    of a 1080p stream, so the pump parks in `write` -- and a parked pump is a pump that can no
+    longer feed the audio pipe the interleaver is waiting on. That cycle mutes sessions (only
+    the stall watchdog can break it, by ending the audio), and it is why the video waits here
+    instead: chunks stay whole in a queue big enough to absorb a whole probe, the descriptor
+    is non-blocking, and a stdin that stays jammed degrades to the oldest chunks dropped and
+    counted -- a bounded gap, not a mute. Unlike the audio's pipe, an error here raises: a
+    closed stdin means FFmpeg is gone and the session has to end, not keep draining the
+    camera into a queue nobody reads.
+    """
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+        os.set_blocking(fd, False)
+        self._pending: deque[bytes] = deque()
+        self._pending_bytes = 0
+        self.dropped = 0
+        self.dropped_chunks = 0
+        self._closed = False
+
+    def write(self, chunk: bytes) -> None:
+        """Queue one chunk, whole, and try the descriptor: what fits goes now, the rest waits."""
+        if self._closed:
+            raise BrokenPipeError("the video pipe is closed")
+        self._pending.append(chunk)
+        self._pending_bytes += len(chunk)
+        while self._pending_bytes > _VIDEO_PENDING_BYTES and len(self._pending) > 1:
+            self.dropped_chunks += 1
+            self.dropped += len(self._pending[0])
+            self._pending_bytes -= len(self._pending[0])
+            self._pending.popleft()
+        self._drain()
+
+    def flush(self) -> None:
+        """Try the descriptor again. The pump calls this on every packet, like the audio's."""
+        self._drain()
+
+    def close(self) -> None:
+        """End the input: what the descriptor has is all FFmpeg gets, and it reads EOF after.
+
+        The queue is dropped rather than flushed because the session is over and the reader
+        behind it -- FFmpeg -- is about to be asked to exit; the bytes still queued belong in
+        the same count as the dropped ones.
+        """
+        self._closed = True
+        self.dropped += self._pending_bytes
+        self.dropped_chunks += len(self._pending)
+        self._pending.clear()
+        self._pending_bytes = 0
+        if self._fd >= 0:
+            fd, self._fd = self._fd, -1
+            with suppress(OSError):
+                os.close(fd)
+
+    def _drain(self) -> None:
+        """Write what fits, oldest first, and keep the rest. A reader that is gone raises,
+        so the session ends the way a blocking stdin's BrokenPipeError ended it."""
+        if self._closed:
+            return
+        while self._pending:
+            try:
+                written = os.write(self._fd, self._pending[0])
+            except BlockingIOError:
+                return
+            self._pending_bytes -= written
+            if written < len(self._pending[0]):
+                self._pending[0] = self._pending[0][written:]
+                return
+            self._pending.popleft()
+
+
 @dataclass
 class _MediaSpan:
     """What one payload type's media looked like in time: first, last, and how many packets.
@@ -634,6 +718,7 @@ class CloudSession:
         self._socket: socket.socket | None = None
         self._ffmpeg: subprocess.Popen[bytes] | None = None
         self._audio_pipe: _AudioPipe | None = None
+        self._video_pipe: _VideoPipe | None = None
         # Audio bytes that never reached FFmpeg, kept here because the pipe is released before the
         # session reports and its own counter would go with it.
         self._audio_lost = 0
@@ -840,9 +925,23 @@ class CloudSession:
         audio_write: int | None = None
         if plan.audio_payload_type is not None:
             audio_read, audio_write = os.pipe()
+            # The audio is the one input that keeps the clock it is given, so it is the
+            # one input whose clock has to be its own: the demuxer paces an ADTS stream
+            # at a frame per 1024 samples whatever the reads do, and the reads here are
+            # bursts -- the pipe is read in one go after the video's probe. The
+            # wallclock it was given is the read time, so a burst would stamp whole
+            # seconds of audio into one instant and the muxer would play them folded;
+            # the demuxer's own timeline is burst-proof. `-itsoffset` is the arrival gap
+            # this session measured between its first audio packet and its first video
+            # one, which is what makes the two timelines share a zero: the demuxer's
+            # clock starts at the audio's first AU, the muxer's at the video's first
+            # frame.
+            span = self._media.get(plan.audio_payload_type)
+            first_video = self.metrics.first_video_at
+            offset = span.first - first_video if span and first_video is not None else 0.0
             argv += [
-                "-use_wallclock_as_timestamps",
-                "1",
+                "-itsoffset",
+                f"{offset:.3f}",
                 "-f",
                 _AAC_DEMUXER,
                 "-i",
@@ -869,6 +968,10 @@ class CloudSession:
             # input FFmpeg never sees the end of.
             os.close(audio_read)
             self._audio_pipe = _AudioPipe(audio_write)
+            # The video goes through a bounded queue for the same reason the audio does:
+            # with a second input to interleave, FFmpeg reads the video with a delay, and a
+            # blocking stdin parks the pump that has to keep the audio moving.
+            self._video_pipe = _VideoPipe(process.stdin.fileno())
         return process
 
     def _launch_remux(
@@ -1217,6 +1320,13 @@ class CloudSession:
         stdin = ffmpeg.stdin
         if stdin is None:  # pragma: no cover - Popen(stdin=PIPE) always provides one
             raise PyEzvizError("FFmpeg was started without a stdin pipe")
+        # With audio to interleave, the video goes through the bounded queue: FFmpeg probes
+        # the video before it opens the audio, and its interleaver reads the video with a
+        # delay a blocking stdin turns into a parked pump -- the deadlock that muted
+        # sessions whose camera kept sending audio. Without audio there is no interleaver
+        # and the blocking stdin is the backpressure that reaches the camera.
+        video_pipe = self._video_pipe
+        video_sink = video_pipe if video_pipe is not None else stdin
         depacketizer = (
             RtpDepacketizer(plan.codec, payload_type=plan.payload_type)
             if plan.codec is not None
@@ -1230,7 +1340,7 @@ class CloudSession:
             else None
         )
         sinks = _Sinks(
-            video=stdin,
+            video=video_sink,
             depacketizer=depacketizer,
             audio=self._audio_pipe,
             audio_depacketizer=audio_depacketizer,
@@ -1280,10 +1390,13 @@ class CloudSession:
             # read. FFmpeg gets its EOF here rather than a few lines below, which is where it was
             # always going to come from anyway.
             self._close_audio()
+            self._finish_video_pipe(video_pipe)
             if depacketizer is not None:
                 self._finish_depacketizer(depacketizer)
                 self._report_audio(audio_depacketizer, plan)
-            # EOF for FFmpeg, which is what ends a session that stopped on its own.
+            # EOF for FFmpeg, which is what ends a session that stopped on its own. With the
+            # video queue the descriptor is already closed above; stdin's own close raises
+            # EBADF on the file object it still owns, which is what the suppression is for.
             with suppress(OSError):
                 stdin.close()
 
@@ -1334,6 +1447,27 @@ class CloudSession:
                 "[FFmpeg] %s%d further payload type(s) not shown",
                 self._label(),
                 len(stats) - _PAYLOAD_TYPE_REPORT_MAX,
+            )
+
+    def _finish_video_pipe(self, video_pipe: _VideoPipe | None) -> None:
+        """Close the video queue, and say what it lost: same release as the audio's pipe.
+
+        Closing is what turns what never reached FFmpeg into a counted loss -- the queue is
+        not flushed, because the session is over -- and the count is reported here so the
+        report is read once the number is final. FFmpeg gets its EOF from the descriptor
+        the close releases.
+        """
+        if video_pipe is None:
+            return
+        video_pipe.close()
+        if video_pipe.dropped:
+            _LOGGER.warning(
+                "[FFmpeg] %s%d byte(s) of the video never reached FFmpeg: the session "
+                "dropped %d of the chunks queued for a stdin that stayed full, and "
+                "the stream jumps where they were",
+                self._label(),
+                video_pipe.dropped,
+                video_pipe.dropped_chunks,
             )
 
     def _end_stalled_audio(self, sinks: _Sinks) -> None:
