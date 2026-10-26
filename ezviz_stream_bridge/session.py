@@ -29,7 +29,7 @@ import subprocess
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from typing import Any, BinaryIO
@@ -38,6 +38,9 @@ from pyezvizapi.cloud_stream import open_cloud_stream
 from pyezvizapi.exceptions import PyEzvizError
 from pyezvizapi.stream import VtmChannel, rtp_payload
 
+from .mpeg_ps import ParameterSets as PsParameterSets
+from .mpeg_ps import ProgramStreamInspector
+from .mpeg_ps import make_prelude as make_ps_prelude
 from .rtp import (
     AAC_LC_16K_MONO,
     AacHbrDepacketizer,
@@ -101,6 +104,7 @@ _VIDEO_PENDING_BYTES = 8 * 1024 * 1024
 # time a session opens a stream, guarded because one camera can serve several sessions at once.
 _PARAMETER_SETS: dict[str, tuple[str, int, bytes]] = {}
 _PARAMETER_SETS_LOCK = threading.Lock()
+_PS_PARAMETER_SETS: dict[str, PsParameterSets] = {}
 
 # Fewer packets than this and an interval says nothing: it would be one measurement with no way
 # to tell a real cadence from the gap before the camera started talking. The same is true of a
@@ -681,6 +685,8 @@ class _PayloadPlan:
     # has none of its own. Empty on every session whose prefix carries them (the stream is
     # already open) and on every join against a cold cache: there is nothing to hand over.
     parameter_prelude: bytes = b""
+    # An MPEG-PS pack and timestamped video PES carrying cached HEVC parameter sets.
+    container_prelude: bytes = b""
 
 
 @dataclass
@@ -1220,6 +1226,8 @@ class CloudSession:
         """
         data = b"".join(packets)
         transport = classify_payload(data)[0] if data else "UNKNOWN"
+        if transport == "MPEG_PS":
+            return self._decide_mpeg_ps(packets)
         if transport != "RTP":
             return _PayloadPlan(transport, _MPEG_PS_DEMUXER, None, None, packets)
 
@@ -1258,6 +1266,33 @@ class CloudSession:
             parameter_prelude=prelude,
         )
 
+    def _decide_mpeg_ps(self, packets: tuple[bytes, ...]) -> _PayloadPlan:
+        inspector = ProgramStreamInspector()
+        current = None
+        for body in packets:
+            current = inspector.feed(body) or current
+        if current is not None:
+            self._remember_ps_parameter_sets(current)
+            return _PayloadPlan("MPEG_PS", _MPEG_PS_DEMUXER, None, None, packets)
+        cached_ps = self._cached_ps_parameter_sets()
+        if cached_ps is not None:
+            prelude = make_ps_prelude(cached_ps)
+            if prelude:
+                _LOGGER.info(
+                    "[FFmpeg] %sMPEG-PS joined mid-GOP; prepending cached HEVC "
+                    "VPS/SPS/PPS from an earlier session",
+                    self._label(),
+                )
+                return _PayloadPlan(
+                    "MPEG_PS",
+                    _MPEG_PS_DEMUXER,
+                    None,
+                    None,
+                    packets,
+                    container_prelude=prelude,
+                )
+        return _PayloadPlan("MPEG_PS", _MPEG_PS_DEMUXER, None, None, packets)
+
     def _remember_parameter_sets(
         self, packets: tuple[bytes, ...], codec: str, payload_type: int | None
     ) -> None:
@@ -1283,6 +1318,27 @@ class CloudSession:
         """What an earlier session of this camera opened with, when there is any."""
         with _PARAMETER_SETS_LOCK:
             return _PARAMETER_SETS.get(self._serial)
+
+    def _remember_ps_parameter_sets(self, sets: PsParameterSets) -> None:
+        """Keep a complete HEVC parameter set and its PS framing for a later join."""
+        if not sets.complete:
+            return
+        with _PARAMETER_SETS_LOCK:
+            _PS_PARAMETER_SETS[self._serial] = sets
+
+    def _cached_ps_parameter_sets(self) -> PsParameterSets | None:
+        with _PARAMETER_SETS_LOCK:
+            return _PS_PARAMETER_SETS.get(self._serial)
+
+    def _observe_ps_parameter_sets(
+        self, inspector: ProgramStreamInspector | None, bodies: Iterable[bytes]
+    ) -> None:
+        if inspector is None:
+            return
+        for body in bodies:
+            sets = inspector.feed(body)
+            if sets is not None:
+                self._remember_ps_parameter_sets(sets)
 
     def _accept(self, packet: Any) -> bytes | None:
         """Check one VTM packet, and return its body when it is video.
@@ -1409,7 +1465,9 @@ class CloudSession:
         # A silent camera's audio must not be able to hold the video behind it, and only a
         # thread can notice that while the pump is blocked writing.
         stall_stop, stall_watchdog = self._start_stall_watchdog(sinks, audio_depacketizer)
+        ps_inspector = ProgramStreamInspector() if plan.transport == "MPEG_PS" else None
         try:
+            self._observe_ps_parameter_sets(ps_inspector, plan.packets)
             if audio_depacketizer is None:
                 self._replay_prefix(sinks, plan)
             else:
@@ -1431,6 +1489,7 @@ class CloudSession:
                     break
                 body = self._accept(packet)
                 if body is not None:
+                    self._observe_ps_parameter_sets(ps_inspector, (body,))
                     sinks.feed(body)
         except (BrokenPipeError, ConnectionResetError):
             # FFmpeg is gone; the reader side reports why the session ended.
@@ -1604,6 +1663,8 @@ class CloudSession:
         """
         if audio is not False and plan.parameter_prelude:
             sinks.video.write(plan.parameter_prelude)
+        if audio is not False and plan.container_prelude:
+            sinks.video.write(plan.container_prelude)
         for body in plan.packets:
             owns = sinks.owns_audio(body)
             if audio is None or owns == audio:

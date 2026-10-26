@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Verify the RTP path against the FFmpeg the add-on actually runs.
+# Verify the RTP and MPEG-PS paths against the FFmpeg the add-on actually runs.
 #
 # The ffmpeg on a development machine proves nothing about the add-on: the image installs
 # Debian's, and a remux that worked on a laptop has failed inside the container before. This
-# builds real H.264, HEVC and AAC elementary streams, packetizes them the way RFC 6184, RFC 7798
-# and RFC 3640 say a camera does, and hands them to FFmpeg through the session itself -- the same
-# prefix read, the same plan, the same argv, the same two pipes. It reimplements nothing: if the
-# module is wrong, the bytes out are wrong.
+# builds real H.264, HEVC and AAC streams, packetizes the RTP ones the way RFC 6184, RFC 7798
+# and RFC 3640 say a camera does, and runs them through the session's own prefix read, plan,
+# FFmpeg argv and pipe handling. It reimplements nothing: if the module is wrong, the bytes out
+# are wrong.
 #
 # The audio leg is checked twice over: the ADTS rebuilt from the Access Units has to be the ADTS
 # FFmpeg wrote in the first place, byte for byte, and the MPEG-TS out of the session has to
@@ -24,12 +24,12 @@ script="$(mktemp -t verify_rtp.XXXXXX.py)"
 trap 'rm -f "${script}"' EXIT
 
 cat > "${script}" <<'PYTHON'
-"""End-to-end check of the RTP path with the FFmpeg the add-on really runs.
+"""End-to-end check of the media paths with the FFmpeg the add-on really runs.
 
 Runs inside the add-on's base image (Debian trixie, the same ffmpeg package the Dockerfile
-installs). It builds real elementary streams, packetizes them the way RFC 6184 / RFC 7798 / RFC
-3640 say a camera does, and pushes everything through this repository's own session and
-depacketizers. Nothing here reimplements either: if the module is wrong, the bytes out are wrong.
+installs). It builds real streams, packetizes the RTP streams the way RFC 6184 / RFC 7798 / RFC
+3640 say a camera does, and pushes the fixtures through this repository's own session. Nothing
+here reimplements the bridge path: if the module is wrong, the bytes out are wrong.
 """
 
 from __future__ import annotations
@@ -511,6 +511,37 @@ def probe_mid_gop_join(source_argv: list[str]) -> None:
     assert remuxed, "the join produced no MPEG-TS"
 
 
+def probe_mpeg_ps_join(source_argv: list[str]) -> None:
+    """A mid-GOP MPEG-PS join, with VPS/SPS/PPS removed from the second source."""
+    source = subprocess.run(source_argv, capture_output=True, check=True).stdout
+    run_session([source])  # the session that saw the parameter sets warms the per-camera cache
+
+    joined_source = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+            "-map", "0", "-c", "copy", "-bsf:v",
+            "filter_units=remove_types=32|33|34", "-f", "mpeg", "pipe:1",
+        ],
+        input=source,
+        capture_output=True,
+        check=True,
+    ).stdout
+    remuxed, lines = run_session([joined_source])
+
+    assert any("MPEG-PS joined mid-GOP" in line for line in lines), (
+        f"the PS join did not use the cached parameter sets: {lines[-3:]}"
+    )
+    found = " ".join(sorted(set(ffprobe(remuxed, "stream=codec_name").split())))
+    frames = decodes(remuxed, HEVC)
+    audio_frames = decodes(remuxed, "mp2")
+    print(
+        f"MPEG-PS mid-GOP join: {len(joined_source)} B -> {len(remuxed)} B MPEG-TS, "
+        f"ffprobe {found!r}, {frames} video and {audio_frames} audio frame(s) decoded"
+    )
+    assert found == "hevc mp2", f"the PS join carries {found!r}"
+    assert frames > 0, "the PS join produced no decodable video frames"
+
+
 def main() -> int:
     version = subprocess.run(
         ["ffmpeg", "-hide_banner", "-version"], capture_output=True, check=True
@@ -523,6 +554,14 @@ def main() -> int:
         "-pix_fmt", "yuv420p",
     ]
     h264 = ["ffmpeg", *common, "-c:v", "libx264", "-f", "h264", "pipe:1"]
+    hevc_ps = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+        "-t", "1", "-pix_fmt", "yuv420p", "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "libx265", "-x265-params", "log-level=error:keyint=15:repeat-headers=1",
+        "-c:a", "mp2", "-ar", "48000", "-f", "mpeg", "pipe:1",
+    ]
     probe_video(H264, "h264", h264)
     probe_video(
         HEVC,
@@ -543,6 +582,7 @@ def main() -> int:
         audio,
     )
     probe_mid_gop_join(h264)
+    probe_mpeg_ps_join(hevc_ps)
     print("VERIFICATION OK")
     return 0
 

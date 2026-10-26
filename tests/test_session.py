@@ -28,6 +28,7 @@ from pyezvizapi.exceptions import PyEzvizError
 from pyezvizapi.stream import VtmChannel
 
 from ezviz_stream_bridge import session as session_module
+from ezviz_stream_bridge.mpeg_ps import make_prelude
 from ezviz_stream_bridge.rtp import H264, AacHbrDepacketizer, RtpDepacketizer, adts_frame
 from ezviz_stream_bridge.session import CloudSession, classify_payload
 
@@ -46,8 +47,10 @@ def _clear_parameter_sets() -> None:
     it and warmed it.
     """
     session_module._PARAMETER_SETS.clear()
+    session_module._PS_PARAMETER_SETS.clear()
     yield
     session_module._PARAMETER_SETS.clear()
+    session_module._PS_PARAMETER_SETS.clear()
 
 
 @dataclass
@@ -698,6 +701,42 @@ def test_an_mpeg_ps_stream_is_forwarded_untouched(vtm, fake_ffmpeg) -> None:
 
     assert errors == []
     assert bytes(sink.data) == first + second
+
+
+def test_mpeg_ps_mid_gop_join_gets_cached_hevc_sets(vtm, fake_ffmpeg, caplog) -> None:
+    caplog.set_level(logging.INFO)
+    pack = bytes.fromhex("000001ba2100010001c33367")
+    start = b"\x00\x00\x01"
+    vps, sps, pps = b"\x40\x01\x0c\x01", b"\x42\x01\x01", b"\x44\x01\xc0"
+
+    def pes(payload: bytes) -> bytes:
+        return start + b"\xe0" + (len(payload) + 3).to_bytes(2, "big") + b"\x80\x00\x00" + payload
+
+    slices = pack + pes(start + b"\x02\x01\x80")
+    opened = pack + pes(b"".join(start + unit for unit in (vps, sps, pps, b"\x26\x01\x80")))
+    # The first eight packets decide the demuxer, but the valid sets only arrive once the
+    # pump has started; that session still has to warm the cache for the following join.
+    vtm([video(slices) for _ in range(8)] + [video(opened)], silent_after=False)
+    first = CloudSession(object(), "PS1234567", ffmpeg_path=fake_ffmpeg, first_video_timeout=0)
+    sink = Sink()
+    thread, errors = run_in_thread(first, sink)
+    thread.join(timeout=TEARDOWN_LIMIT)
+    assert not thread.is_alive()
+    assert errors == []
+    assert bytes(sink.data) == slices * 8 + opened
+
+    joined = pack + pes(start + b"\x02\x01\x80")
+    vtm([video(joined)], silent_after=False)
+    second = CloudSession(object(), "PS1234567", ffmpeg_path=fake_ffmpeg, first_video_timeout=0)
+    sink = Sink()
+    thread, errors = run_in_thread(second, sink)
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert not thread.is_alive()
+    assert errors == []
+    cached = session_module._PS_PARAMETER_SETS["PS1234567"]
+    assert bytes(sink.data) == make_prelude(cached) + joined
+    assert any("MPEG-PS joined mid-GOP" in record.getMessage() for record in caplog.records)
 
 
 def test_classify_payload_recognises_mpeg_ps_at_any_offset() -> None:

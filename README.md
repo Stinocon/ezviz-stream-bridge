@@ -110,23 +110,25 @@ This project is the part that has to keep working for weeks unattended:
   depacketized into an Annex-B elementary stream (single NAL units, STAP-A and AP
   aggregates, FU-A and FU fragments) before FFmpeg is started with `-f h264` or `-f hevc`
   and `-use_wallclock_as_timestamps`, without which the MPEG-TS muxer refuses a stream
-  that has no container to carry a timestamp. An MPEG-PS stream is untouched: same
-  demuxer, byte for byte. The price is up to eight packets of added latency on every
-  session, because the decision has to happen before FFmpeg exists.
+  that has no container to carry a timestamp. An MPEG-PS stream keeps the same demuxer and
+  is forwarded byte for byte, except when a mid-GOP join needs cached HEVC parameter sets.
+  The price is up to eight packets of added latency on every session, because the decision
+  has to happen before FFmpeg exists.
 - **A connection that joins the stream mid-GOP gets the parameter sets it arrived without.**
   A camera keeps one encoder timeline across sessions, so a second connection — the one a
   player opens beside the first — attaches between keyframes and receives slices only: the
   parameter sets belong to the keyframe the stream opened with, not to the session, and a
   battery camera's keyframe interval is longer than any client waits. Such a join used to
   open FFmpeg's `mpeg` demuxer and produce nothing at all, `bytes=0`, until the client gave
-  up on it. Now the session that opens the stream leaves its parameter sets in a per-camera
-  cache, and a join whose leading packets carry none is served from it: the sets go ahead of
-  its slices, FFmpeg reads the codec the stream actually is, and the picture is clean from
-  the next keyframe on — the artifacts until then are the join's own failure mode, not the
-  mute or the black it used to be. A join against a cold cache — no session of that camera
-  has opened a stream yet — keeps the old behaviour and says so, and the cache never
-  expires: a camera does not change its parameter sets between sessions of the same
-  stream, and the next one that opens a stream overwrites whatever it holds.
+  up on it. The bridge now caches complete parameter sets per camera for both RTP and HEVC
+  inside MPEG-PS. For PS, it reads video PES payloads but leaves the camera's packets alone;
+  when a later join starts without VPS/SPS/PPS, it writes the cached sets first in a new
+  timestamped video PES, inside a pack header copied from that camera's stream. FFmpeg
+  then reads the original PS, including its audio, and the next keyframe can decode. A cold
+  cache, with no earlier session supplying complete sets, keeps the old behaviour because the
+  bridge cannot reconstruct sets it has never seen. The cache keeps each camera's last complete
+  sets and has no expiry; a camera that changes its encoder parameters may therefore need
+  a fresh session that supplies the new complete set before later joins use it.
 - **Audio is depacketized too, when the camera sends it.** A camera that puts its video on RTP
   puts its sound there as well, under a second payload type: RFC 3640 MPEG4-GENERIC in `AAC-hbr`
   mode. It is the same problem twice. The payload carries no ADTS header, so one is rebuilt from
@@ -270,13 +272,15 @@ pytest
 ruff check .
 ```
 
-The RTP path is verified against the FFmpeg the add-on actually runs, not the one on a development
-machine: the image installs Debian's, and a remux that worked on a laptop has failed inside the
-container before. The script builds synthetic H.264, HEVC and AAC streams, packetizes them the way
-RFC 6184, RFC 7798 and RFC 3640 say a camera does, runs them through the real session (its prefix
-read, its plan, its argv, both its pipes), and checks what comes out. The ADTS rebuilt from the AAC
+The RTP and MPEG-PS paths are verified against the FFmpeg the add-on actually runs, not the one
+on a development machine: the image installs Debian's, and a remux that worked on a laptop has
+failed inside the container before. The script builds synthetic H.264, HEVC and AAC streams,
+packetizes them the way RFC 6184, RFC 7798 and RFC 3640 say a camera does, and runs them through
+the real session. It checks the prefix classification, FFmpeg arguments, remuxed streams and
+decodability. The ADTS rebuilt from the AAC
 Access Units has to be the ADTS FFmpeg wrote, byte for byte, and the MPEG-TS has to carry streams
-that decode.
+that decode. The unit suite also generates a short HEVC MPEG-PS with the installed FFmpeg and
+checks that a parameter-set prelude still probes and decodes when prepended to it.
 
 ```bash
 tools/verify_rtp_against_addon.sh
