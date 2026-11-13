@@ -7,6 +7,7 @@ counter that the logs report, which must stay correct under concurrent connect/c
 
 from __future__ import annotations
 
+import http.client
 import logging
 import socket
 import threading
@@ -188,7 +189,12 @@ def test_wait_for_cooldown_returns_when_the_consumer_has_gone() -> None:
     server.server_close()
 
 
-DURATION_FLAGS = ("--first-video-timeout", "--timeout-cooldown", "--audio-window")
+DURATION_FLAGS = (
+    "--first-video-timeout",
+    "--timeout-cooldown",
+    "--max-stream-duration",
+    "--audio-window",
+)
 
 
 def _duration_args(tmp_path: Path, flag: str, value: str) -> list[str]:
@@ -211,12 +217,11 @@ def _duration_args(tmp_path: Path, flag: str, value: str) -> list[str]:
 def test_a_duration_the_bridge_cannot_use_is_refused_at_the_command_line(
     tmp_path: Path, flag: str, value: str
 ) -> None:
-    """All three durations, not only the one the audio feature added.
+    """Every duration option refuses non-finite and negative values.
 
-    They are the same defect at the same three doors: `float()` accepts `nan` and `inf`, and every
+    `float()` accepts `nan` and `inf`, and every
     comparison against them is false afterwards, so a no-video budget set to `nan` never fires and
-    a cooldown set to `inf` never ends. A fix with no test is a claim, which is how the two older
-    flags kept the defect for a release after the third one lost it.
+    a cooldown set to `inf` never ends.
     """
     with pytest.raises(SystemExit):
         _parse_args(_duration_args(tmp_path, flag, value))
@@ -255,24 +260,6 @@ class _RejectedSession:
 
     def run(self, _output: object) -> None:
         raise EzvizAuthTokenExpired("the refresh session has expired")
-
-
-class _HangingSession(_RejectedSession):
-    """A healthy stream, still running when another connection finds the session expired."""
-
-    started = threading.Event()
-
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        super().__init__(*args, **kwargs)
-        self._ended = threading.Event()
-
-    def abort(self, reason: str) -> None:
-        super().abort(reason)
-        self._ended.set()
-
-    def run(self, _output: object) -> None:
-        type(self).started.set()
-        self._ended.wait(10)
 
 
 def _get(port: int, path: str = "/BB1234567.ts") -> bytes:
@@ -332,28 +319,99 @@ def test_a_restart_ends_the_streams_still_running_and_logs_each_close(
 ) -> None:
     caplog.set_level(logging.INFO)
     sessions: list[_RejectedSession] = []
+    producer_started = threading.Event()
+    reject_session = threading.Event()
 
     def next_session(*args: object, **kwargs: object) -> _RejectedSession:
-        kind = _HangingSession if not sessions else _RejectedSession
-        sessions.append(kind(*args, **kwargs))
+        class DelayedRejected(_RejectedSession):
+            def run(self, _output: object) -> None:
+                producer_started.set()
+                reject_session.wait(5)
+                raise EzvizAuthTokenExpired("the refresh session has expired")
+
+        sessions.append(DelayedRejected(*args, **kwargs))
         return sessions[-1]
 
-    _HangingSession.started.clear()
     monkeypatch.setattr(proxy_module, "CloudSession", next_session)
     result, thread = _serve(monkeypatch, tmp_path)
     port = result["server"].server_address[1]
 
-    healthy = threading.Thread(target=_get, args=(port,), daemon=True)
-    healthy.start()
-    assert _HangingSession.started.wait(5)
-    _get(port)
+    first = threading.Thread(target=_get, args=(port,), daemon=True)
+    second = threading.Thread(target=_get, args=(port,), daemon=True)
+    first.start()
+    assert producer_started.wait(5)
+    second.start()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with result["server"].hub._condition:
+            if len(result["server"].hub._subscribers) == 2:
+                break
+        time.sleep(0.01)
+    else:
+        reject_session.set()
+        pytest.fail("the second HTTP consumer did not join the shared upstream")
+    reject_session.set()
     thread.join(timeout=10)
-    healthy.join(timeout=5)
+    first.join(timeout=5)
+    second.join(timeout=5)
 
     assert result["code"] == SESSION_REJECTED_EXIT
-    assert sessions[0].abort_reason == "session expired"
-    closes = [r.getMessage() for r in caplog.records if "closed after=" in r.getMessage()]
+    assert len(sessions) == 1
+    closes = [r.getMessage() for r in caplog.records if "subscription closed" in r.getMessage()]
     assert len(closes) == 2, closes
+
+
+def test_concurrent_http_consumers_share_one_cloud_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sessions: list[object] = []
+
+    class StreamingSession:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            self.metrics = SessionMetrics()
+            self.abort_reason: str | None = None
+            self.stopped = threading.Event()
+            sessions.append(self)
+
+        def abort(self, reason: str) -> None:
+            self.abort_reason = self.abort_reason or reason
+            self.stopped.set()
+
+        def run(self, output: object) -> None:
+            self.stopped.wait(PEER_POLL_INTERVAL * 1.5)
+            while not self.stopped.is_set():
+                output.write(b"x" * 188)  # type: ignore[attr-defined]
+                self.metrics.video_packets += 1
+                self.stopped.wait(0.01)
+
+    monkeypatch.setattr(proxy_module, "CloudSession", StreamingSession)
+    result, thread = _serve(monkeypatch, tmp_path)
+    port = result["server"].server_address[1]
+    first = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    second = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    first.request("GET", "/BB1234567.ts")
+    first_response = first.getresponse()
+    assert first_response.status == 200
+    assert len(first_response.read(188)) == 188
+
+    second.request("GET", "/BB1234567.ts")
+    second_response = second.getresponse()
+    assert second_response.status == 200
+    assert len(second_response.read(188)) == 188
+    assert len(sessions) == 1
+
+    first.close()
+    first_response.close()
+    time.sleep(PEER_POLL_INTERVAL * 2)
+    assert sessions[0].abort_reason is None  # type: ignore[attr-defined]
+    assert len(second_response.read(188)) == 188
+
+    second.close()
+    second_response.close()
+    assert sessions[0].stopped.wait(2)  # type: ignore[attr-defined]
+    result["server"].shutdown()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
 
 
 def test_an_ordinary_cloud_error_does_not_stop_the_proxy(

@@ -86,11 +86,12 @@ This project is the part that has to keep working for weeks unattended:
 
 - **One supervised proxy per camera**, restarted with a growing, capped delay. A camera that
   cannot work — a serial that is not on the account — backs off instead of looping.
-- **On-demand by construction, and instrumented.** The proxy runs in-process, so every HTTP
-  connection is logged with an id, source address and User-Agent, and one VTM session opens per
-  connection. No client, no VTM, no camera drain; the bridge never generates a request of its
-  own, so an `active` count that will not return to 0 points straight at the external consumer
-  holding it open.
+- **On-demand by construction, shared, and instrumented.** Concurrent HTTP connections for one
+  camera share a VTM session and FFmpeg remux. Each connection still has its own id, source
+  address and User-Agent in the log. A late join gets a bounded rolling MPEG-TS tail, then the
+  live stream; a slow consumer is disconnected before it can build an unbounded queue or stall
+  the other viewers. The shared session closes when its last consumer leaves. No client, no VTM,
+  no camera drain; the bridge never generates a request of its own.
 - **A session cannot outlive its consumer.** The request socket is watched for a peer close, so
   a consumer that disappears is noticed within half a second even when no video is flowing and
   there is nothing to write to it — which is exactly when a battery camera is asleep and the
@@ -239,11 +240,13 @@ ezviz-stream-bridge --options ./options.json --token-file ./ezviz_token.json
 }
 ```
 
-Two more keys are optional and left out above, because their defaults live in the proxy:
+Three keys are optional and left out above, because their defaults live in the proxy:
 `first_video_timeout` (seconds a session waits for the camera's first video packet, 25 by
 default, `0` waits indefinitely) and `timeout_cooldown` (seconds a new session is withheld after
 a camera timeout, 30 by default, `0` disables it). They are the proxy's `--first-video-timeout`
-and `--timeout-cooldown`, passed through only when set.
+and `--timeout-cooldown`, passed through only when set. `max_stream_duration` optionally caps
+the lifetime of a shared upstream and closes all its HTTP consumers at once; it defaults to `0`
+(disabled), and consumers that reconnect start a fresh session.
 
 `serial` is the device serial, **not** the six-letter verification code printed on the camera.
 The easiest way to find it is to fill in the credentials, leave `serial` empty and start once:
@@ -257,7 +260,8 @@ connection's lifecycle: `python -m ezviz_stream_bridge.proxy --help`. `--first-v
 sets the no-video budget (`0` disables it, restoring the pre-0.1.3 behaviour of waiting
 indefinitely), `--timeout-cooldown` sets how long a new session is withheld after a camera
 timeout (`0` disables it), `--audio-window` sets how long the session reads ahead for the
-camera's audio before starting FFmpeg (`0` serves video only), and `--log-level debug` adds the
+camera's audio before starting FFmpeg (`0` serves video only), and `--max-stream-duration`
+sets the optional hard lifetime for a shared stream (`0` disables it). `--log-level debug` adds the
 consumer's request headers to the log.
 `--log-ffmpeg-stderr` captures FFmpeg's own diagnostics when a stream produces no output, and with
 it the leading packets of any payload that is not MPEG-PS, and — for a session that carries more

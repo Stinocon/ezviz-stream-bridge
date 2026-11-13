@@ -228,7 +228,11 @@ def test_the_restart_after_an_expired_session_goes_through_the_token_check(
 
 @pytest.mark.parametrize(
     ("option", "flag"),
-    [("first_video_timeout", "--first-video-timeout"), ("timeout_cooldown", "--timeout-cooldown")],
+    [
+        ("first_video_timeout", "--first-video-timeout"),
+        ("timeout_cooldown", "--timeout-cooldown"),
+        ("max_stream_duration", "--max-stream-duration"),
+    ],
 )
 def test_a_wait_reaches_the_proxy_only_when_it_is_set(
     monkeypatch: pytest.MonkeyPatch, option: str, flag: str

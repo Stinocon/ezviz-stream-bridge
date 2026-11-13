@@ -1,4 +1,4 @@
-"""One VTM session per HTTP request, with a teardown that does not depend on data.
+"""One cancellable VTM reader/remux per camera hub, with teardown independent of data.
 
 `pyezvizapi.cloud_stream.copy_cloud_stream_to_mpegts` does this job in a single call,
 and 0.1.2 used it. The problem is that it owns both the FFmpeg process and the VTM

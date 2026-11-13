@@ -162,9 +162,9 @@ def test_a_bad_audio_window_names_the_option(value: object) -> None:
         BridgeConfig.from_options(_options(audio_window=value))
 
 
-# -- the two waits the proxy already had, now reachable from the add-on ---------------------------
+# -- optional proxy durations exposed by the add-on -----------------------------------------------
 
-DURATION_OPTIONS = ("first_video_timeout", "timeout_cooldown")
+DURATION_OPTIONS = ("first_video_timeout", "timeout_cooldown", "max_stream_duration")
 
 
 @pytest.mark.parametrize("option", DURATION_OPTIONS)

@@ -284,6 +284,8 @@ class Supervisor:
             command += ["--first-video-timeout", f"{self._config.first_video_timeout:g}"]
         if self._config.timeout_cooldown is not None:
             command += ["--timeout-cooldown", f"{self._config.timeout_cooldown:g}"]
+        if self._config.max_stream_duration is not None:
+            command += ["--max-stream-duration", f"{self._config.max_stream_duration:g}"]
 
         try:
             # stdout/stderr are inherited so the proxy's own messages land in the

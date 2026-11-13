@@ -55,12 +55,11 @@ class BridgeConfig:
     # the option was not set at all, and the proxy's own default applies: the add-on always
     # writes it because `config.yaml` declares it, but a hand-written options.json need not.
     audio_window: float | None = None
-    # Seconds a session waits for the camera's first video packet, and seconds a new session is
-    # withheld after a camera timeout. None for both unless the option is set, for the same
-    # reason as `audio_window`: the proxy holds the defaults, and the add-on declares both
-    # options as optional so that it never becomes a second place the numbers live.
+    # Optional session-duration overrides. None means the proxy's own default applies; each
+    # add-on key remains optional so the defaults have one home.
     first_video_timeout: float | None = None
     timeout_cooldown: float | None = None
+    max_stream_duration: float | None = None
 
     @classmethod
     def from_options(cls, options: dict[str, Any]) -> BridgeConfig:
@@ -107,6 +106,9 @@ class BridgeConfig:
                 options.get("first_video_timeout"), "first_video_timeout"
             ),
             timeout_cooldown=cls._as_seconds(options.get("timeout_cooldown"), "timeout_cooldown"),
+            max_stream_duration=cls._as_seconds(
+                options.get("max_stream_duration"), "max_stream_duration"
+            ),
         )
 
     @staticmethod

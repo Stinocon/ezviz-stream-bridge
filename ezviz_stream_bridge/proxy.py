@@ -7,11 +7,10 @@ logged with an id, its source address, its User-Agent, and the exact moment it
 opens and closes. Without that, "who keeps requesting the stream?" is unanswerable,
 and that question is the whole point of the on-demand design.
 
-The lifecycle is on-demand by construction, and this module does not add any retry,
-reconnect or keepalive: one GET opens one VTM session, and the session is closed the
-instant the client goes away. No client, no VTM, no camera battery drain. Every GET
-in the log is therefore an inbound request from a real consumer, never something the
-bridge generated itself.
+The lifecycle is on-demand by construction: concurrent GETs for one camera share a VTM
+session and remux, and the session closes as soon as the last client goes away. No client,
+no VTM, no camera battery drain. Every GET in the log is therefore an inbound request
+from a real consumer, never something the bridge generated itself.
 
 The one deliberate exception is the post-timeout cooldown: when a session ends because
 the camera went offline mid-stream, the next wake-up is delayed so a reconnect loop in
@@ -38,12 +37,13 @@ import time
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, BinaryIO, cast
+from typing import Any, cast
 from urllib.parse import urlparse
 
 from pyezvizapi.client import EzvizClient
 from pyezvizapi.exceptions import DeviceException, PyEzvizError
 
+from .hub import StreamHub, Subscription
 from .log import configure_logging, level_for
 from .session import DEFAULT_AUDIO_WINDOW, DEFAULT_FIRST_VIDEO_TIMEOUT, CloudSession
 from .token import SESSION_REJECTED_EXIT, read_token_file, session_rejected
@@ -59,6 +59,7 @@ PEER_POLL_INTERVAL = 0.5
 # consumer reconnects would wake it again seconds after it just fell asleep -- the loop
 # that flattens a battery camera. 0 disables the cooldown.
 TIMEOUT_COOLDOWN = 30.0
+CLIENT_WRITE_TIMEOUT = 5.0
 
 # How long a proxy that is stepping aside for a new login waits for its other streams to tear
 # down cleanly before it exits anyway. Their FFmpeg and VTM socket die with the process either
@@ -69,8 +70,8 @@ RESTART_DRAIN = 5.0
 class ProxyServer(ThreadingHTTPServer):
     """Threaded HTTP server holding the shared client and per-camera settings.
 
-    Threaded because each consumer gets its own VTM session; daemon threads so a
-    shutdown is not held up by a stream that will not end on its own.
+    Threaded so each HTTP consumer can read independently from the per-camera hub; daemon
+    threads keep shutdown from being held up by a consumer that will not leave on its own.
     """
 
     daemon_threads = True
@@ -86,6 +87,7 @@ class ProxyServer(ThreadingHTTPServer):
         ffmpeg_path: str,
         first_video_timeout: float = DEFAULT_FIRST_VIDEO_TIMEOUT,
         timeout_cooldown: float = TIMEOUT_COOLDOWN,
+        max_stream_duration: float = 0,
         ffmpeg_stderr: bool = False,
         audio_window: float = DEFAULT_AUDIO_WINDOW,
         monotonic: Callable[[], float] = time.monotonic,
@@ -109,6 +111,27 @@ class ProxyServer(ThreadingHTTPServer):
         self._sessions: set[CloudSession] = set()
         self._restart_requested = False
         super().__init__(address, _ProxyHandler)
+        self.hub = StreamHub(
+            make_session=self._make_session,
+            before_start=self.wait_for_cooldown,
+            on_track=self.track,
+            on_untrack=self.untrack,
+            on_camera_timeout=lambda conn_id, err: _on_camera_timeout(self, conn_id, err),
+            on_cloud_error=lambda conn_id, err: _on_cloud_error(self, conn_id, err),
+            max_duration=max_stream_duration,
+        )
+
+    def _make_session(self, conn_id: int) -> CloudSession:
+        return CloudSession(
+            self.client,
+            self.serial,
+            ffmpeg_path=self.ffmpeg_path,
+            first_video_timeout=self.first_video_timeout,
+            audio_window=self.audio_window,
+            ffmpeg_stderr=self.ffmpeg_stderr,
+            connection_id=conn_id,
+            on_event=lambda event, elapsed: _log_session_event(conn_id, event, elapsed),
+        )
 
     def next_id(self) -> int:
         """A monotonically increasing connection id for correlating log lines."""
@@ -236,9 +259,11 @@ def watch_peer(sock: socket.socket, stop: threading.Event, on_gone: Callable[[],
 # How a session's abort reason reads in the connection log.
 _REASONS = {
     "client gone": "client disconnected",
+    "slow consumer": "slow consumer",
     "no video": "no video",
     "finished": "stream ended",
     "session expired": "session expired",
+    "max duration": "maximum stream duration reached",
 }
 
 
@@ -255,7 +280,7 @@ def _log_session_event(conn_id: int, event: str, elapsed: float) -> None:
     elif event == "first-video":
         _LOGGER.info("[VTM]  conn=%d first-video after=%.3fs", conn_id, elapsed)
     elif event == "first-byte":
-        _LOGGER.info("[HTTP] conn=%d first-byte after=%.3fs", conn_id, elapsed)
+        _LOGGER.info("[VTM]  conn=%d first-remux-byte after=%.3fs", conn_id, elapsed)
 
 
 def _on_camera_timeout(server: ProxyServer, conn_id: int, err: DeviceException) -> str:
@@ -301,7 +326,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     server_version = "ezviz-stream-bridge/1"
     protocol_version = "HTTP/1.1"
 
-    def do_GET(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+    def do_GET(self) -> None:  # noqa: N802, PLR0912, PLR0915 - one complete HTTP lifecycle
         server = cast(ProxyServer, self.server)
         if urlparse(self.path).path != server.path:
             self.send_error(404, "Stream not found")
@@ -324,73 +349,78 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             for name, value in self.headers.items():
                 _LOGGER.debug("[HTTP] conn=%d header %s: %s", conn_id, name, value)
 
-        session = CloudSession(
-            server.client,
-            server.serial,
-            ffmpeg_path=server.ffmpeg_path,
-            first_video_timeout=server.first_video_timeout,
-            audio_window=server.audio_window,
-            ffmpeg_stderr=server.ffmpeg_stderr,
-            connection_id=conn_id,
-            on_event=lambda event, elapsed: _log_session_event(conn_id, event, elapsed),
-        )
-        server.track(session)
+        subscription: Subscription | None = None
         stop_watching = threading.Event()
         watcher: threading.Thread | None = None
 
         reason = "stream ended"
+        first_byte_logged = False
         try:
+            self.connection.settimeout(CLIENT_WRITE_TIMEOUT)
             self.send_response(200)
             self.send_header("Content-Type", "video/MP2T")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Connection", "close")
             self.end_headers()
+            subscription = server.hub.subscribe(conn_id)
 
-            # One VTM session for the life of this request, and one watchdog that can
-            # end it the moment the consumer disappears -- including while the camera is
-            # asleep and nothing is being written, which is precisely when a disconnect
-            # used to go unnoticed and leave the cloud session behind.
+            # One upstream serves every concurrent consumer. A disconnect removes only its
+            # subscription; the last consumer leaving aborts the upstream session.
             watcher = threading.Thread(
                 target=watch_peer,
-                args=(self.connection, stop_watching, lambda: session.abort("client gone")),
+                args=(
+                    self.connection,
+                    stop_watching,
+                    lambda: (
+                        server.hub.unsubscribe(subscription) if subscription is not None else None
+                    ),
+                ),
                 name=f"peer-{conn_id}",
                 daemon=True,
             )
             watcher.start()
-
-            # A previous session may have ended because the camera went offline mid-stream
-            # ("camera timeout"). Do not wake it again the instant this consumer reconnects:
-            # wait out the cooldown first, unless the consumer is already gone.
-            server.wait_for_cooldown(session)
-            if session.abort_reason is not None:
-                reason = _REASONS.get(session.abort_reason, "client disconnected")
-            else:
-                _LOGGER.info("[VTM]  conn=%d session opening", conn_id)
-                session.run(cast(BinaryIO, self.wfile))
-                reason = _REASONS.get(session.abort_reason or "", reason)
-        except (BrokenPipeError, ConnectionResetError):
+            _LOGGER.info("[HTTP] conn=%d subscribed to shared stream", conn_id)
+            while True:
+                chunk = subscription.read()
+                if chunk is None:
+                    terminal = subscription.reason or "stream ended"
+                    reason = _REASONS.get(terminal, terminal)
+                    break
+                if not chunk:
+                    continue
+                if not first_byte_logged:
+                    _LOGGER.info(
+                        "[HTTP] conn=%d first-byte after=%.3fs",
+                        conn_id,
+                        time.monotonic() - started,
+                    )
+                    first_byte_logged = True
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except OSError:
             reason = "client disconnected"
         except DeviceException as err:
             reason = _on_camera_timeout(server, conn_id, err)
         except PyEzvizError as err:
             reason = _on_cloud_error(server, conn_id, err)
+        except Exception:
+            reason = "error"
+            _LOGGER.exception("[HTTP] conn=%d request handler failed", conn_id)
         finally:
-            server.untrack(session)
+            if subscription is not None:
+                server.hub.unsubscribe(subscription)
             stop_watching.set()
             if watcher is not None:
                 watcher.join(timeout=PEER_POLL_INTERVAL * 4)
             remaining = server.closed()
-            _LOGGER.info(
-                "[VTM]  conn=%d session closed",
-                conn_id,
-            )
+            _LOGGER.info("[HTTP] conn=%d subscription closed", conn_id)
             _LOGGER.info(
                 "[HTTP] conn=%d closed after=%.3fs reason=%r bytes=%d video-packets=%d active=%d",
                 conn_id,
                 time.monotonic() - started,
                 reason,
-                session.metrics.bytes_out,
-                session.metrics.video_packets,
+                subscription.bytes_out if subscription is not None else 0,
+                subscription.session.metrics.video_packets if subscription is not None else 0,
                 remaining,
             )
 
@@ -462,6 +492,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--max-stream-duration",
+        type=_finite_seconds,
+        default=0,
+        help="maximum seconds one shared camera stream stays open (default: 0, disabled)",
+    )
+    parser.add_argument(
         "--audio-window",
         type=_finite_seconds,
         default=DEFAULT_AUDIO_WINDOW,
@@ -503,6 +539,7 @@ def main(argv: list[str] | None = None) -> int:
             ffmpeg_path=args.ffmpeg_path,
             first_video_timeout=args.first_video_timeout,
             timeout_cooldown=args.timeout_cooldown,
+            max_stream_duration=args.max_stream_duration,
             audio_window=args.audio_window,
             ffmpeg_stderr=args.log_ffmpeg_stderr,
         )
