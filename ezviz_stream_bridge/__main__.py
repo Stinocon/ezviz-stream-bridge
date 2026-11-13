@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -14,7 +13,7 @@ from .config import DEFAULT_REGION, BridgeConfig, ConfigError, load_options
 from .devices import list_account_cameras
 from .log import configure_logging
 from .supervisor import Supervisor
-from .token import TokenStore
+from .token import TokenStore, read_token_file
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -117,7 +116,7 @@ def _client_for_listing(options: dict[str, Any], token_file: Path) -> EzvizClien
     """
     region = str(options.get("region") or "").strip() or DEFAULT_REGION
 
-    token = _load_token(token_file)
+    token = read_token_file(token_file)
     if token is not None:
         return EzvizClient(token=token, url=region)
 
@@ -129,17 +128,6 @@ def _client_for_listing(options: dict[str, Any], token_file: Path) -> EzvizClien
     client = EzvizClient(username, password, region)
     client.login()
     return client
-
-
-def _load_token(token_file: Path) -> dict[str, Any] | None:
-    """Return a stored token that at least carries a session, or None."""
-    try:
-        data = json.loads(token_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if isinstance(data, dict) and data.get("session_id"):
-        return data
-    return None
 
 
 if __name__ == "__main__":

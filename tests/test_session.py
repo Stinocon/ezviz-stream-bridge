@@ -27,6 +27,8 @@ import pytest
 from pyezvizapi.exceptions import PyEzvizError
 from pyezvizapi.stream import VtmChannel
 
+from ezviz_stream_bridge import parameter_cache
+from ezviz_stream_bridge import pipes as pipes_module
 from ezviz_stream_bridge import session as session_module
 from ezviz_stream_bridge.mpeg_ps import make_prelude
 from ezviz_stream_bridge.rtp import H264, AacHbrDepacketizer, RtpDepacketizer, adts_frame
@@ -46,11 +48,9 @@ def _clear_parameter_sets() -> None:
     the same camera reads, and a test would otherwise depend on whichever test ran before
     it and warmed it.
     """
-    session_module._PARAMETER_SETS.clear()
-    session_module._PS_PARAMETER_SETS.clear()
+    parameter_cache.clear()
     yield
-    session_module._PARAMETER_SETS.clear()
-    session_module._PS_PARAMETER_SETS.clear()
+    parameter_cache.clear()
 
 
 @dataclass
@@ -742,7 +742,8 @@ def test_mpeg_ps_mid_gop_join_gets_cached_hevc_sets(vtm, fake_ffmpeg, caplog) ->
 
     assert not thread.is_alive()
     assert errors == []
-    cached = session_module._PS_PARAMETER_SETS["PS1234567"]
+    cached = parameter_cache.cached_ps("PS1234567")
+    assert cached is not None
     assert bytes(sink.data) == make_prelude(cached) + joined
     assert any("MPEG-PS joined mid-GOP" in record.getMessage() for record in caplog.records)
 
@@ -776,7 +777,7 @@ def test_mpeg_ps_sets_that_do_not_read_are_named_and_never_cached(
 
     assert not thread.is_alive()
     assert errors == []
-    assert "PS7654321" not in session_module._PS_PARAMETER_SETS
+    assert parameter_cache.cached_ps("PS7654321") is None
     warnings = [r.getMessage() for r in caplog.records if "do not read" in r.getMessage()]
     assert len(warnings) == 1, warnings
     assert "Video Encryption" in warnings[0]
@@ -813,7 +814,8 @@ def test_mpeg_ps_readable_sets_later_in_the_stream_still_warm_the_cache(
     thread.join(timeout=TEARDOWN_LIMIT)
 
     assert errors == []
-    assert session_module._PS_PARAMETER_SETS["PS1111111"].complete
+    cached = parameter_cache.cached_ps("PS1111111")
+    assert cached is not None and cached.complete
     assert not any("do not read" in r.getMessage() for r in caplog.records)
 
 
@@ -1729,7 +1731,7 @@ def test_video_over_the_queue_bound_drops_the_oldest_and_says_so(
     dropped.
     """
     caplog.set_level(logging.WARNING)
-    monkeypatch.setattr(session_module, "_VIDEO_PENDING_BYTES", 64 * 1024)
+    monkeypatch.setattr(pipes_module, "_VIDEO_PENDING_BYTES", 64 * 1024)
     ffmpeg_path, audio_file = jamming_ffmpeg
     unit = bytes(range(200)) + b"\xaa" * 56
     packets = [video(rtp_packet(SPS_PAYLOAD, payload_type=96))]

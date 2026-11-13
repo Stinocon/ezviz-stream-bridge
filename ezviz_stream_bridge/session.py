@@ -28,7 +28,6 @@ import socket
 import subprocess
 import threading
 import time
-from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, replace
@@ -38,21 +37,27 @@ from pyezvizapi.cloud_stream import open_cloud_stream
 from pyezvizapi.exceptions import PyEzvizError
 from pyezvizapi.stream import VtmChannel, rtp_payload
 
+from . import parameter_cache
 from .mpeg_ps import ParameterSets as PsParameterSets
 from .mpeg_ps import ProgramStreamInspector
 from .mpeg_ps import make_prelude as make_ps_prelude
-from .rtp import (
-    AAC_LC_16K_MONO,
-    AacHbrDepacketizer,
-    RtpDepacketizer,
-    carries_aac_hbr,
-    describe_config,
-    detect_codec,
-    parameter_sets,
-    parse_au_section,
-    set_channels,
-    stream_channels,
+from .payload import (
+    _MPEG_PS_DEMUXER,
+    _audio_channels,
+    _audio_config,
+    _audio_payload,
+    _carries_media,
+    _codec_of,
+    _describe_rtp_header,
+    _payload_type_of,
+    _PayloadPlan,
+    _prefix_audio,
+    _why_not_served,
+    classify_payload,
 )
+from .pipes import _AudioPipe, _Sinks, _VideoPipe
+from .remux import remux_argv
+from .rtp import AacHbrDepacketizer, RtpDepacketizer, describe_config, parameter_sets
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -85,26 +90,6 @@ DEFAULT_AUDIO_WINDOW = 2.0
 # what normally ends the wait, so this only has to be a bound and not a second window.
 _AUDIO_WINDOW_BYTES = 4 * 1024 * 1024
 
-# How much audio the pipe has not taken yet. A pipe holds 64 KiB, and FFmpeg can leave the audio
-# unread for as long as it is waiting for video -- so without a bound of its own this buffer is the
-# only thing standing between a slow consumer and an unbounded one. A minute of this family's
-# audio is about 200 KiB.
-_AUDIO_PENDING_BYTES = 256 * 1024
-
-# How much video the stdin queue holds for FFmpeg. Its probe of the video input runs before it
-# opens the audio one, and the interleaver will not drain the video past the audio's timestamps:
-# the whole probe's worth of video has to wait, and a 1080p camera sends 150-500 KiB/s -- so the
-# bound that absorbs one probe plus one slow start is a few MiB, not the 64 KiB of the pipe. A
-# consumer further behind than this is not slow but stalled: the oldest chunks are dropped and
-# counted, because a queue this deep is already most of a minute of video.
-_VIDEO_PENDING_BYTES = 8 * 1024 * 1024
-
-# The parameter sets a camera's stream opened with, kept per serial for the sessions that join
-# the same stream mid-GOP and get none of their own. One entry per camera, overwritten every
-# time a session opens a stream, guarded because one camera can serve several sessions at once.
-_PARAMETER_SETS: dict[str, tuple[str, int, bytes]] = {}
-_PARAMETER_SETS_LOCK = threading.Lock()
-_PS_PARAMETER_SETS: dict[str, PsParameterSets] = {}
 
 # Fewer packets than this and an interval says nothing: it would be one measurement with no way
 # to tell a real cadence from the gap before the camera started talking. The same is true of a
@@ -185,358 +170,6 @@ _PACKET_DUMP_PAYLOAD = 64
 # types past it are counted, and said to be counted, rather than printed.
 _PAYLOAD_TYPE_REPORT_MAX = 6
 
-# The demuxer FFmpeg reads MPEG-PS with. Anything else here is an elementary stream the
-# session has already depacketized, and the name is the codec.
-_MPEG_PS_DEMUXER = "mpeg"
-
-# The demuxer FFmpeg reads ADTS with, which is the framing the audio path rebuilds out of an
-# RFC 3640 payload: the camera's audio arrives bare, and this is the only spelling of it that
-# FFmpeg has a demuxer for.
-_AAC_DEMUXER = "aac"
-
-# MPEG-PS pack_start_code. The byte after `00 00 01` is 0xBA, whose top bit is set -- the
-# forbidden_zero_bit of an H.264/H.265 NAL header -- so it cannot be a valid NAL, and a
-# conformant elementary stream cannot contain this sequence (emulation prevention blocks
-# `00 00 01` inside a NAL). Finding it is strong evidence of MPEG-PS.
-_PS_PACK_START = b"\x00\x00\x01\xba"
-_TS_SYNC_BYTE = 0x47
-_TS_PACKET_SIZE = 188
-# Sync bytes required on the 188-byte grid. Two is a coincidence about one time in nine on
-# random data; three is about one time in two thousand, low enough to trust as a diagnostic.
-_TS_SYNC_RUN = 3
-# The two top bits of an RTP header byte carry the version, which is 2 here.
-_RTP_VERSION_MASK = 0xC0
-_RTP_VERSION_2 = 0x80
-# The fixed part of an RTP header, before any CSRC list or extension.
-_RTP_HEADER_BYTES = 12
-
-
-def _looks_like_mpeg_ts(data: bytes, start: int) -> bool:
-    """True when 0x47 repeats on the 188-byte grid from `start` for several packets."""
-    for index in range(1, _TS_SYNC_RUN):
-        position = start + index * _TS_PACKET_SIZE
-        if position >= len(data) or data[position] != _TS_SYNC_BYTE:
-            return False
-    return True
-
-
-def classify_payload(data: bytes) -> tuple[str, int]:
-    """Best-effort transport for a buffered prefix, and where its signature sits.
-
-    Returns a `pyezvizapi` `StreamTransport` name and the byte offset of the signature, or
-    -1 when nothing recognisable is present. MPEG-PS is checked first and recognised by its
-    pack start code, which may sit at any offset when the prefix starts mid-pack -- the
-    reason a single-packet check could not see it. RTP has no in-band sync pattern, so it is
-    only recognisable at the start of the buffer, and it is checked last: a mid-packet TS
-    start whose first byte happens to carry RTP's version bits would otherwise be reported
-    as RTP, far more often than a genuine RTP payload would produce a chance 0x47 grid.
-    """
-    pack = data.find(_PS_PACK_START)
-    if pack >= 0:
-        return "MPEG_PS", pack
-
-    sync = data.find(bytes((_TS_SYNC_BYTE,)))
-    while sync >= 0:
-        if _looks_like_mpeg_ts(data, sync):
-            return "MPEG_TS", sync
-        sync = data.find(bytes((_TS_SYNC_BYTE,)), sync + 1)
-
-    if data and (data[0] & _RTP_VERSION_MASK) == _RTP_VERSION_2:
-        return "RTP", 0
-
-    return "UNKNOWN", -1
-
-
-def _codec_of(body: bytes) -> str | None:
-    """The codec a video packet's payload names, if it names one."""
-    try:
-        return detect_codec(rtp_payload(body))
-    except PyEzvizError:
-        return None
-
-
-def _audio_payload(body: bytes) -> bool:
-    """True when a video packet's payload is audio this bridge can turn into ADTS.
-
-    The reading is self-validating rather than a payload type: the AU sizes have to account
-    for every byte of the payload exactly, which no other kind of packet does by accident. A
-    camera that stamps its audio with a different payload type, or renumbers it mid-session,
-    is therefore still recognised -- and one that sends a second kind of video under a payload
-    type of its own is not mistaken for a camera with audio.
-    """
-    try:
-        return carries_aac_hbr(rtp_payload(body))
-    except PyEzvizError:
-        return False
-
-
-def _prefix_audio(payload_type: int | None, packets: tuple[bytes, ...]) -> int | None:
-    """The audio payload type, when the video prefix already carried some.
-
-    Separate from the window because it is the common case and it costs nothing: a camera that
-    starts its audio with its video puts it inside the eight packets the demuxer is chosen
-    from, and there is then nothing to wait for. Only a camera that starts later makes the
-    session read on.
-    """
-    for body in packets:
-        candidate = _payload_type_of(body)
-        if candidate != payload_type and _audio_payload(body):
-            return candidate
-    return None
-
-
-def _audio_channels(payload_type: int | None, packets: tuple[bytes, ...]) -> int | None:
-    """The channel count the camera's own bytes name, from the first Access Unit that names one.
-
-    The first, and not the first Access Unit: an encoder's primer frame is a fill element with
-    no channel of its own -- FFmpeg's own AAC encoder opens with one, measured -- so a reading
-    taken from packet one would be "this says nothing" on a perfectly ordinary stereo stream.
-    Scanning on, inside the packets the session already had to parse, is what makes the reading
-    land instead of falling back to the family's default.
-
-    A payload type of None is not the audio's, whatever the bytes look like: it is how a body
-    that is not an RTP packet is counted, and matching it here would hand the channel count of
-    an unrelated payload to the audio stream.
-    """
-    if payload_type is None:
-        return None
-    for body in packets:
-        if _payload_type_of(body) != payload_type:
-            continue
-        try:
-            units = parse_au_section(rtp_payload(body))
-        except PyEzvizError:
-            continue
-        for unit in units or ():
-            channels = stream_channels(unit)
-            if channels is not None:
-                return channels
-    return None
-
-
-def _why_not_served(
-    audio_window: float, window_closed_at: float | None, first_at: float
-) -> str:
-    """When a payload type that carried media was there, relative to the session's audio window.
-
-    Two facts, and no cause. Comparing against the *configured* window instead of the one the
-    session actually ran is what made the first version of this line blame the window for a payload
-    that started inside it: the window opens after the VTM handshake and the prefix read, so on a
-    slow handshake it is still open well past `audio_window` seconds into the session. The only
-    thing that can be said without measuring anything else is whether the media arrived before or
-    after the moment the session stopped looking -- and that is enough, because it is what decides
-    whether raising the window is the fix or a number changed for nothing.
-    """
-    if audio_window <= 0 or window_closed_at is None:
-        return "the audio path is off (audio_window 0)"
-    if first_at > window_closed_at:
-        return f"it started after the {audio_window:g}s audio window closed"
-    return f"it started before the {audio_window:g}s audio window closed"
-
-
-def _audio_config(plan: _PayloadPlan) -> int:
-    """The AudioSpecificConfig for a session: the family's, with what the camera said about it.
-
-    Only the channel count is ever replaced. The sample rate is not in the payload at all -- an
-    Access Unit carries no such field, and the RTP timestamp counts samples rather than naming a
-    rate -- so the rate stays the family's 16 kHz and is cross-checked against the measured
-    cadence where that cadence is reported.
-    """
-    if plan.audio_channels is None:
-        return AAC_LC_16K_MONO
-    return set_channels(AAC_LC_16K_MONO, plan.audio_channels)
-
-
-def _payload_type_of(body: bytes) -> int | None:
-    """The RTP payload type of a packet body, or None when it is not an RTP header."""
-    if len(body) < _RTP_HEADER_BYTES or (body[0] & _RTP_VERSION_MASK) != _RTP_VERSION_2:
-        return None
-    return body[1] & 0x7F
-
-
-def _carries_media(body: bytes) -> bool:
-    """True when a video packet holds anything besides headers.
-
-    A non-empty body is not enough to call it video. The CS-C8c opens a session with two
-    payload-type-112 packets that are 64 and 44 bytes long and carry no media at all -- their
-    header extension consumes the whole packet -- and taking those for video would disarm the
-    no-video budget for a camera that then sent nothing else, which is the one case that budget
-    exists for.
-    """
-    if not body:
-        return False
-    if len(body) >= _RTP_HEADER_BYTES and (body[0] & _RTP_VERSION_MASK) == _RTP_VERSION_2:
-        try:
-            return bool(rtp_payload(body))
-        except PyEzvizError:
-            # An RTP-shaped header the unwrap rejects is still something the camera sent.
-            return True
-    return True
-
-
-class _AudioPipe:
-    """The write end of the pipe FFmpeg reads the audio from -- and never a place to park.
-
-    A blocking write here is a deadlock with no way out of it. FFmpeg opens its inputs in order
-    and probes the video one before it opens the audio input at all, so a thread parked in
-    `write` on a full audio pipe is parked while FFmpeg waits for video that the same thread has
-    not written yet -- and no watchdog can help, because closing a file does not wake a thread
-    that is already inside `write`. The descriptor is therefore non-blocking, and what it will not
-    take is kept here and offered again on every later packet, video included: FFmpeg always
-    reaches the audio pipe once it has the video its probe wants, and then it drains this.
-
-    Whole chunks rather than bytes, and bounded. A chunk is one packet's Access Units, so dropping
-    the oldest when the bound is reached loses frames instead of corrupting the framing. `dropped`
-    counts every audio byte that never reached FFmpeg -- the chunks the bound threw away, and
-    whatever was still queued when the session ended or FFmpeg died -- and the session reports it:
-    a camera that outruns FFmpeg for longer than the bound gets gaps it can be told about, which is
-    a number rather than a session that quietly loses sound.
-    """
-
-    def __init__(self, fd: int) -> None:
-        os.set_blocking(fd, False)
-        self._fd = fd
-        # Held only around non-blocking operations, so it cannot park anybody: it is here so that
-        # a close from the stall watchdog cannot land between a write's check and its syscall,
-        # where the descriptor could already have been recycled by another thread.
-        self._lock = threading.Lock()
-        self._pending: deque[bytes] = deque()
-        self._pending_bytes = 0
-        self.dropped = 0
-        self._closed = False
-
-    def write(self, frames: bytes) -> None:
-        """Offer audio bytes to the pipe, keeping what it will not take."""
-        with self._lock:
-            if self._closed:
-                return
-            self._pending.append(frames)
-            self._pending_bytes += len(frames)
-            while self._pending_bytes > _AUDIO_PENDING_BYTES and len(self._pending) > 1:
-                self.dropped += len(self._pending.popleft())
-                self._pending_bytes = sum(len(chunk) for chunk in self._pending)
-            self._drain()
-
-    def flush(self) -> None:
-        """Try the pipe again with whatever is waiting for room."""
-        with self._lock:
-            self._drain()
-
-    def close(self) -> None:
-        """Release the descriptor, once. Later writes find it closed and do nothing."""
-        with self._lock:
-            if self._closed:
-                return
-            # Set before the syscall: the flag is what keeps a recycled descriptor number from
-            # ever being written to by a write that lost the race.
-            self._closed = True
-            with suppress(OSError):
-                os.close(self._fd)
-            # Counted as well, not just discarded: these bytes never reached FFmpeg either, and a
-            # number that means "the bound threw some away" while silently dropping the tail would
-            # undercount exactly the case it exists for.
-            self.dropped += self._pending_bytes
-            self._pending.clear()
-            self._pending_bytes = 0
-
-    def _drain(self) -> None:
-        """Write what fits, oldest first, and keep the rest. Called with the lock held."""
-        if self._closed:
-            return
-        while self._pending:
-            try:
-                written = os.write(self._fd, self._pending[0])
-            except BlockingIOError:
-                return
-            except OSError:
-                # The reader is gone: FFmpeg is dead and the teardown is on its way. What is left
-                # never made it out, and it belongs in the same count as the rest.
-                self.dropped += self._pending_bytes
-                self._pending.clear()
-                self._pending_bytes = 0
-                return
-            self._pending_bytes -= written
-            if written < len(self._pending[0]):
-                self._pending[0] = self._pending[0][written:]
-                return
-            self._pending.popleft()
-
-
-class _VideoPipe:
-    """The video's write end of FFmpeg's stdin: a bounded queue that cannot park the pump.
-
-    FFmpeg probes the video input before it opens the audio one, and its interleaver will not
-    drain the video past the audio's timestamps: from the first audio packet to the end of the
-    session, the video is always read with a delay. A blocking stdin holds less than a second
-    of a 1080p stream, so the pump parks in `write` -- and a parked pump is a pump that can no
-    longer feed the audio pipe the interleaver is waiting on. That cycle mutes sessions (only
-    the stall watchdog can break it, by ending the audio), and it is why the video waits here
-    instead: chunks stay whole in a queue big enough to absorb a whole probe, the descriptor
-    is non-blocking, and a stdin that stays jammed degrades to the oldest chunks dropped and
-    counted -- a bounded gap, not a mute. Unlike the audio's pipe, an error here raises: a
-    closed stdin means FFmpeg is gone and the session has to end, not keep draining the
-    camera into a queue nobody reads.
-    """
-
-    def __init__(self, fd: int) -> None:
-        self._fd = fd
-        os.set_blocking(fd, False)
-        self._pending: deque[bytes] = deque()
-        self._pending_bytes = 0
-        self.dropped = 0
-        self.dropped_chunks = 0
-        self._closed = False
-
-    def write(self, chunk: bytes) -> None:
-        """Queue one chunk, whole, and try the descriptor: what fits goes now, the rest waits."""
-        if self._closed:
-            raise BrokenPipeError("the video pipe is closed")
-        self._pending.append(chunk)
-        self._pending_bytes += len(chunk)
-        while self._pending_bytes > _VIDEO_PENDING_BYTES and len(self._pending) > 1:
-            self.dropped_chunks += 1
-            self.dropped += len(self._pending[0])
-            self._pending_bytes -= len(self._pending[0])
-            self._pending.popleft()
-        self._drain()
-
-    def flush(self) -> None:
-        """Try the descriptor again. The pump calls this on every packet, like the audio's."""
-        self._drain()
-
-    def close(self) -> None:
-        """End the input: what the descriptor has is all FFmpeg gets, and it reads EOF after.
-
-        The queue is dropped rather than flushed because the session is over and the reader
-        behind it -- FFmpeg -- is about to be asked to exit; the bytes still queued belong in
-        the same count as the dropped ones.
-        """
-        self._closed = True
-        self.dropped += self._pending_bytes
-        self.dropped_chunks += len(self._pending)
-        self._pending.clear()
-        self._pending_bytes = 0
-        if self._fd >= 0:
-            fd, self._fd = self._fd, -1
-            with suppress(OSError):
-                os.close(fd)
-
-    def _drain(self) -> None:
-        """Write what fits, oldest first, and keep the rest. A reader that is gone raises,
-        so the session ends the way a blocking stdin's BrokenPipeError ended it."""
-        if self._closed:
-            return
-        while self._pending:
-            try:
-                written = os.write(self._fd, self._pending[0])
-            except BlockingIOError:
-                return
-            self._pending_bytes -= written
-            if written < len(self._pending[0]):
-                self._pending[0] = self._pending[0][written:]
-                return
-            self._pending.popleft()
-
 
 @dataclass
 class _MediaSpan:
@@ -551,142 +184,6 @@ class _MediaSpan:
     first: float
     last: float
     packets: int = 1
-
-
-@dataclass
-class _Sinks:
-    """Where one packet goes: FFmpeg's video pipe, and its audio pipe when there is one.
-
-    Routing lives here rather than at each of the two call sites -- the prefix replay and the
-    live loop -- because it is one decision taken from one fact, the packet's payload type,
-    and the two have to take it the same way. A packet of the audio payload type belongs to
-    the audio sink only when a depacketizer exists for it: with none, it falls through to the
-    video one, which counts it as another payload type and skips it, exactly as it did before
-    this path existed.
-
-    Not frozen, unlike the rest of this module's value objects: the audio input can be given up
-    mid-session (see `_end_stalled_audio`), and after that there is no audio sink to write to.
-    """
-
-    video: BinaryIO
-    depacketizer: RtpDepacketizer | None
-    audio: _AudioPipe | None = None
-    audio_depacketizer: AacHbrDepacketizer | None = None
-    now: Callable[[], float] = time.monotonic
-    audio_at: float = 0.0  # when audio was last written, for the stall check
-
-    def __post_init__(self) -> None:
-        if self.audio is not None:
-            # The clock starts with the input, not at the epoch: a zero here would read as a
-            # stall that has not happened.
-            self.audio_at = self.now()
-
-    def owns_audio(self, body: bytes) -> bool:
-        """True when this packet is the audio stream's, rather than one to skip."""
-        return (
-            self.audio is not None
-            and self.audio_depacketizer is not None
-            and _payload_type_of(body) == self.audio_depacketizer.payload_type
-        )
-
-    def feed(self, body: bytes) -> None:
-        """Write one packet to the sink that owns it, and only when it produces bytes."""
-        if not body:
-            return
-        audio = self.audio_depacketizer
-        if audio is not None and self.owns_audio(body):
-            frames = audio.feed(body)
-            # Bound once, and after the parse rather than at the check above. The watchdog may
-            # have given the input up while those bytes were being unpacked, and re-reading the
-            # attribute here would be the one thing this path cannot afford: an AttributeError
-            # on `None` is not an OSError, so it would escape the guard below, reach the pump's
-            # `except Exception` and take the whole session down -- video included -- at exactly
-            # the moment the watchdog was saving it. A bound reference to a pipe that is already
-            # closed does nothing instead.
-            pipe = self.audio
-            if frames and pipe is not None:
-                pipe.write(frames)
-                self.audio_at = self.now()
-            return
-        # A video packet is also the moment to try the audio pipe again: one comparison when
-        # nothing is waiting, and it is what lets the audio sink do without a thread of its own.
-        if self.audio is not None:
-            self.audio.flush()
-        chunk = self.depacketizer.feed(body) if self.depacketizer is not None else body
-        if chunk:
-            self.video.write(chunk)
-            self.video.flush()
-
-    def give_up_audio(self) -> bool:
-        """Release the audio input, once. False when there is nothing left to give up.
-
-        Called from the watchdog thread while the pump may be writing, so the reference is
-        dropped before the pipe is closed: the pump then loses frames rather than the session.
-        Dropping it first is also what keeps `feed` from writing through a reference that is
-        already closed, and the pipe closes the descriptor itself rather than the descriptor
-        number being reused while a write still holds it.
-        """
-        target, self.audio = self.audio, None
-        if target is None:
-            return False
-        target.close()
-        return True
-
-
-def _describe_rtp_header(body: bytes) -> str:
-    """Decode the fixed RTP header fields, or say that the bytes are not one.
-
-    The twelve fixed bytes only, so the reading is the one the specification gives and not
-    an interpretation: X, CC and P decide where the payload starts and how much of its tail is
-    padding, which is the whole point of printing them -- with X set and a length of 12 words,
-    the media begins at byte 64 and no 24-byte head could have shown it. The SSRC is here for
-    the same reason: two payload types can share one synchronisation source and still number
-    their packets separately, and which of the two this is decides how to read the rest of a
-    session that carries more than one.
-    """
-    if len(body) < _RTP_HEADER_BYTES or (body[0] & _RTP_VERSION_MASK) != _RTP_VERSION_2:
-        return "none"
-    return (
-        f"V{body[0] >> 6} P{(body[0] >> 5) & 1} X{(body[0] >> 4) & 1} CC{body[0] & 0x0F} "
-        f"M{body[1] >> 7} PT{body[1] & 0x7F} "
-        f"seq=0x{int.from_bytes(body[2:4], 'big'):04x} "
-        f"ts=0x{int.from_bytes(body[4:8], 'big'):08x} "
-        f"ssrc=0x{int.from_bytes(body[8:12], 'big'):08x}"
-    )
-
-
-@dataclass(frozen=True)
-class _PayloadPlan:
-    """What the leading video packets are, and how FFmpeg has to be started to read them.
-
-    `demuxer` is the FFmpeg input format. For an RTP payload it is the codec itself: the
-    session depacketizes to Annex-B, so there is no RTP left for FFmpeg to read. `codec` and
-    `payload_type` are None unless that depacketization is needed; the payload type is the one
-    the codec was identified from, so nothing else on the same RTP session is mistaken for it.
-
-    `audio_payload_type` is filled in afterwards, by the audio window, and it is the one field
-    that cannot come from the video prefix: the camera's audio is a second payload type that
-    may not have started yet when the video codec is already known. When it is set, FFmpeg is
-    started with a second input, and `packets` includes what was read while waiting for it.
-    """
-
-    transport: str
-    demuxer: str
-    codec: str | None
-    payload_type: int | None
-    packets: tuple[bytes, ...]
-    audio_payload_type: int | None = None
-    # The channel count the camera's own Access Units named, or None when none of the ones in
-    # the prefix named one. None is not "no channels": it means the family's default is what
-    # this session will use, and the report says so rather than letting the log imply a reading
-    # that was never taken. The sample rate has no such field at all -- see `_audio_config`.
-    audio_channels: int | None = None
-    # The parameter sets an earlier session of this camera opened with, ahead of a join that
-    # has none of its own. Empty on every session whose prefix carries them (the stream is
-    # already open) and on every join against a cold cache: there is nothing to hand over.
-    parameter_prelude: bytes = b""
-    # An MPEG-PS pack and timestamped video PES carrying cached HEVC parameter sets.
-    container_prelude: bytes = b""
 
 
 @dataclass
@@ -904,69 +401,35 @@ class CloudSession:
             sock.shutdown(socket.SHUT_RDWR)
 
     def _start_ffmpeg(self, plan: _PayloadPlan) -> subprocess.Popen[bytes]:
-        """MPEG-TS out of whatever the camera sent, with no re-encoding.
-
-        Two input formats are possible. MPEG-PS is the case this was built for and FFmpeg
-        demuxes it directly with `mpeg`. RTP is not, and no demuxer reads it out of a pipe --
-        `rtp` wants a UDP URL and an SDP -- so by the time FFmpeg is started the session has
-        depacketized to Annex-B and the demuxer names the elementary stream it is receiving,
-        `h264` or `hevc`.
-
-        `-use_wallclock_as_timestamps` is what makes that second case work at all: a raw
-        elementary stream has no container to carry a timestamp, and without one the MPEG-TS
-        muxer refuses the packet outright -- `first pts and dts value must be set`, zero bytes
-        written, for H.264 and HEVC alike. Wallclock is the packet's arrival time, which for a
-        live stream is the right reading anyway, and ADTS carries no presentation time either,
-        so the audio input is given the same one.
+        """Start the remux `remux_argv` describes, with its inputs and its stderr wired up.
 
         Audio is a second input on its own descriptor. It cannot share the video pipe -- one
         pipe carries one elementary stream -- and it cannot be a file, because it is being
         produced as the camera sends it. The descriptor is created here, handed to the child
-        with `pass_fds` and named as `pipe:<fd>`, which is the only spelling that reads a pipe
-        FFmpeg did not open itself; the write end is kept for the pump and released by the
-        teardown.
+        with `pass_fds`, and the write end is kept for the pump and released by the teardown.
+        Its offset is the arrival gap this session measured between its first audio packet and
+        its first video one.
 
         Normally FFmpeg's stderr is discarded and its level kept at `error`. With the
         diagnostic on it is piped and the level raised to `info`, so the reason a remux
         produces nothing is visible instead of the process simply sitting there mute.
         """
         capturing = self._ffmpeg_stderr
-        argv = [
-            self._ffmpeg_path,
-            "-hide_banner",
-            "-loglevel",
-            _FFMPEG_LOG_LEVEL if capturing else "error",
-        ]
-        if plan.demuxer != _MPEG_PS_DEMUXER:
-            argv += ["-use_wallclock_as_timestamps", "1"]
-        argv += ["-f", plan.demuxer, "-i", "pipe:0"]
         audio_read: int | None = None
         audio_write: int | None = None
+        offset = 0.0
         if plan.audio_payload_type is not None:
             audio_read, audio_write = os.pipe()
-            # The audio is the one input that keeps the clock it is given, so it is the
-            # one input whose clock has to be its own: the demuxer paces an ADTS stream
-            # at a frame per 1024 samples whatever the reads do, and the reads here are
-            # bursts -- the pipe is read in one go after the video's probe. The
-            # wallclock it was given is the read time, so a burst would stamp whole
-            # seconds of audio into one instant and the muxer would play them folded;
-            # the demuxer's own timeline is burst-proof. `-itsoffset` is the arrival gap
-            # this session measured between its first audio packet and its first video
-            # one, which is what makes the two timelines share a zero: the demuxer's
-            # clock starts at the audio's first AU, the muxer's at the video's first
-            # frame.
             span = self._media.get(plan.audio_payload_type)
             first_video = self.metrics.first_video_at
             offset = span.first - first_video if span and first_video is not None else 0.0
-            argv += [
-                "-itsoffset",
-                f"{offset:.3f}",
-                "-f",
-                _AAC_DEMUXER,
-                "-i",
-                f"pipe:{audio_read}",
-            ]
-        argv += ["-c", "copy", "-f", "mpegts", "pipe:1"]
+        argv = remux_argv(
+            self._ffmpeg_path,
+            plan,
+            log_level=_FFMPEG_LOG_LEVEL if capturing else "error",
+            audio_fd=audio_read,
+            audio_offset=offset,
+        )
         try:
             process = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
                 argv,
@@ -1319,24 +782,20 @@ class CloudSession:
         prelude = parameter_sets(packets, codec, payload_type)
         if not prelude:
             return
-        with _PARAMETER_SETS_LOCK:
-            _PARAMETER_SETS[self._serial] = (codec, payload_type, prelude)
+        parameter_cache.remember(self._serial, codec, payload_type, prelude)
 
     def _cached_parameter_sets(self) -> tuple[str, int, bytes] | None:
         """What an earlier session of this camera opened with, when there is any."""
-        with _PARAMETER_SETS_LOCK:
-            return _PARAMETER_SETS.get(self._serial)
+        return parameter_cache.cached(self._serial)
 
     def _remember_ps_parameter_sets(self, sets: PsParameterSets) -> None:
         """Keep a complete HEVC parameter set and its PS framing for a later join."""
         if not sets.complete:
             return
-        with _PARAMETER_SETS_LOCK:
-            _PS_PARAMETER_SETS[self._serial] = sets
+        parameter_cache.remember_ps(self._serial, sets)
 
     def _cached_ps_parameter_sets(self) -> PsParameterSets | None:
-        with _PARAMETER_SETS_LOCK:
-            return _PS_PARAMETER_SETS.get(self._serial)
+        return parameter_cache.cached_ps(self._serial)
 
     def _observe_ps_parameter_sets(
         self, inspector: ProgramStreamInspector | None, bodies: Iterable[bytes]
