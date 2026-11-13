@@ -7,14 +7,19 @@ counter that the logs report, which must stay correct under concurrent connect/c
 
 from __future__ import annotations
 
+import logging
 import socket
 import threading
+import time
 from pathlib import Path
 
 import pytest
+from pyezvizapi.exceptions import EzvizAuthTokenExpired, PyEzvizError
 
+from ezviz_stream_bridge import proxy as proxy_module
 from ezviz_stream_bridge.proxy import PEER_POLL_INTERVAL, ProxyServer, _parse_args, watch_peer
-from ezviz_stream_bridge.session import CloudSession
+from ezviz_stream_bridge.session import CloudSession, SessionMetrics
+from ezviz_stream_bridge.token import SESSION_REJECTED_EXIT
 
 
 @pytest.fixture
@@ -228,3 +233,162 @@ def test_a_usable_duration_survives_the_command_line(
     assert getattr(args, flag.lstrip("-").replace("-", "_")) == float(value)
 
 
+
+
+# -- stepping aside when the cloud stops accepting the session ---------------------------------
+#
+# The proxy holds the token and not the password, so once the cloud refuses to renew the
+# session, every stream it opens fails the same way until somebody logs in again -- and only
+# the supervisor can. Before 0.1.18 the proxy kept serving those failures until the add-on was
+# restarted by hand; now it stops, and says why with its exit code.
+
+
+class _RejectedSession:
+    """A session whose stream fails the way an expired login does."""
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        self.metrics = SessionMetrics()
+        self.abort_reason: str | None = None
+
+    def abort(self, reason: str) -> None:
+        self.abort_reason = self.abort_reason or reason
+
+    def run(self, _output: object) -> None:
+        raise EzvizAuthTokenExpired("the refresh session has expired")
+
+
+class _HangingSession(_RejectedSession):
+    """A healthy stream, still running when another connection finds the session expired."""
+
+    started = threading.Event()
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self._ended = threading.Event()
+
+    def abort(self, reason: str) -> None:
+        super().abort(reason)
+        self._ended.set()
+
+    def run(self, _output: object) -> None:
+        type(self).started.set()
+        self._ended.wait(10)
+
+
+def _get(port: int, path: str = "/BB1234567.ts") -> bytes:
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+        conn.sendall(f"GET {path} HTTP/1.1\r\nHost: test\r\n\r\n".encode())
+        chunks = []
+        while chunk := conn.recv(65536):
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+
+def _serve(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[dict, threading.Thread]:
+    """Run the proxy's `main` on an ephemeral port; returns its result box and thread."""
+    created: list[ProxyServer] = []
+
+    class Recording(ProxyServer):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    monkeypatch.setattr(proxy_module, "ProxyServer", Recording)
+    monkeypatch.setattr(proxy_module, "_load_client", lambda *_args: object())
+    # `main` sets logging up with `force=True`, which would take the capture handler with it.
+    monkeypatch.setattr(proxy_module, "configure_logging", lambda _level: None)
+    result: dict = {}
+    argv = _duration_args(tmp_path, "--timeout-cooldown", "0")
+    argv[argv.index("--port") + 1] = "0"
+    thread = threading.Thread(target=lambda: result.update(code=proxy_module.main(argv)))
+    thread.start()
+    for _ in range(200):
+        if created:
+            break
+        time.sleep(0.01)
+    result["server"] = created[0]
+    return result, thread
+
+
+def test_a_rejected_session_stops_the_proxy_with_its_own_exit_code(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(proxy_module, "CloudSession", _RejectedSession)
+    result, thread = _serve(monkeypatch, tmp_path)
+
+    _get(result["server"].server_address[1])
+    thread.join(timeout=10)
+
+    assert not thread.is_alive(), "the proxy kept serving on a session the cloud refused"
+    assert result["code"] == SESSION_REJECTED_EXIT
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("no longer accepts the session" in line for line in messages)
+    assert any("reason='session expired'" in line for line in messages)
+
+
+def test_a_restart_ends_the_streams_still_running_and_logs_each_close(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    sessions: list[_RejectedSession] = []
+
+    def next_session(*args: object, **kwargs: object) -> _RejectedSession:
+        kind = _HangingSession if not sessions else _RejectedSession
+        sessions.append(kind(*args, **kwargs))
+        return sessions[-1]
+
+    _HangingSession.started.clear()
+    monkeypatch.setattr(proxy_module, "CloudSession", next_session)
+    result, thread = _serve(monkeypatch, tmp_path)
+    port = result["server"].server_address[1]
+
+    healthy = threading.Thread(target=_get, args=(port,), daemon=True)
+    healthy.start()
+    assert _HangingSession.started.wait(5)
+    _get(port)
+    thread.join(timeout=10)
+    healthy.join(timeout=5)
+
+    assert result["code"] == SESSION_REJECTED_EXIT
+    assert sessions[0].abort_reason == "session expired"
+    closes = [r.getMessage() for r in caplog.records if "closed after=" in r.getMessage()]
+    assert len(closes) == 2, closes
+
+
+def test_an_ordinary_cloud_error_does_not_stop_the_proxy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class Failing(_RejectedSession):
+        def run(self, _output: object) -> None:
+            raise PyEzvizError("Could not find VTM server for resource 1")
+
+    monkeypatch.setattr(proxy_module, "CloudSession", Failing)
+    result, thread = _serve(monkeypatch, tmp_path)
+    server = result["server"]
+
+    _get(server.server_address[1])
+    thread.join(timeout=1)
+
+    try:
+        assert thread.is_alive(), "a cloud error that says nothing about the session stopped it"
+        assert not server.restart_requested
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+    assert result["code"] == 0
+
+
+def test_a_restart_is_requested_once_however_many_streams_ask(server: ProxyServer) -> None:
+    calls = []
+    server.shutdown = lambda: calls.append(1)  # type: ignore[method-assign]
+
+    for _ in range(5):
+        server.request_restart()
+    for _ in range(50):
+        if calls:
+            break
+        time.sleep(0.01)
+
+    assert server.restart_requested
+    assert calls == [1]

@@ -21,7 +21,7 @@ from importlib import metadata
 from types import FrameType
 
 from .config import BridgeConfig, CameraConfig
-from .token import MfaRequiredError, TokenStore
+from .token import SESSION_REJECTED_EXIT, MfaRequiredError, TokenStore
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -196,6 +196,22 @@ class Supervisor:
         proxy.process = None
         proxy.logged_wait = False
         proxy.next_attempt_at = self._clock() + proxy.backoff
+
+        if code == SESSION_REJECTED_EXIT:
+            # Not a crash: the proxy found the session expired and stepped aside, because the
+            # login it needs is one only this process can do. The next start goes through
+            # `ensure()`, which renews the token or logs in again before the proxy is back.
+            # The accounting stays the same as for any other exit, and that is deliberate: a
+            # proxy that keeps coming back with this code straight after a fresh login is the
+            # one case where hurrying would spend logins, and EZVIZ rate-limits them.
+            _LOGGER.warning(
+                "Camera %s: the EZVIZ cloud no longer accepts the session (after %.0fs). "
+                "Renewing it and restarting the proxy in %.0fs.",
+                proxy.camera.serial,
+                uptime,
+                proxy.backoff,
+            )
+            return
 
         _LOGGER.warning(
             "Camera %s: proxy exited with code %s after %.0fs (failure %d). "

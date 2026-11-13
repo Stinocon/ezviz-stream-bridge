@@ -22,6 +22,7 @@ from ezviz_stream_bridge.supervisor import (
     Supervisor,
     _Proxy,
 )
+from ezviz_stream_bridge.token import SESSION_REJECTED_EXIT
 
 
 def _proxy() -> _Proxy:
@@ -173,3 +174,52 @@ def test_startup_says_which_version_is_running(
     lines = [record.getMessage() for record in caplog.records]
     expected = f"ezviz-stream-bridge {metadata.version('ezviz-stream-bridge')}"
     assert expected in lines, lines[:4]
+
+
+class _ExitedProcess(_FakeProcess):
+    def __init__(self, returncode: int) -> None:
+        self.returncode = returncode
+
+
+def test_a_proxy_that_found_the_session_expired_is_not_reported_as_a_crash(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The proxy steps aside so the supervisor can log in; the log has to say that, not
+    "exited with code 3", or the one restart that fixes something reads like a fault."""
+    caplog.set_level(logging.INFO)
+    supervisor = _supervisor()
+    proxy = supervisor._proxies[0]
+
+    supervisor._note_exit(proxy, _ExitedProcess(SESSION_REJECTED_EXIT))  # type: ignore[arg-type]
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("no longer accepts the session" in line for line in messages), messages
+    assert not any("exited with code" in line for line in messages), messages
+    assert proxy.failures == 1
+    assert proxy.next_attempt_at > 0
+
+
+def test_the_restart_after_an_expired_session_goes_through_the_token_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checks = []
+
+    class Tokens(_FakeTokens):
+        def ensure(self) -> None:
+            checks.append(1)
+
+    monkeypatch.setattr(supervisor_module.subprocess, "Popen", lambda command: _FakeProcess())
+    options = {
+        "username": "user@example.com",
+        "password": "secret",
+        "cameras": [{"serial": "BB1234567", "port": 8558}],
+    }
+    supervisor = Supervisor(BridgeConfig.from_options(options), Tokens())  # type: ignore[arg-type]
+    proxy = supervisor._proxies[0]
+    supervisor._note_exit(proxy, _ExitedProcess(SESSION_REJECTED_EXIT))  # type: ignore[arg-type]
+    proxy.next_attempt_at = 0.0
+
+    supervisor._reconcile()
+
+    assert checks == [1]
+    assert proxy.running

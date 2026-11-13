@@ -9,7 +9,9 @@ password stays in this process's memory, and the proxies only ever receive
 
 The cost of that choice is that nothing else refreshes the token, so this module
 owns expiry: `ensure()` is called before every proxy start, verifies the stored
-token against the cloud, and logs in again when it has stopped working.
+token against the cloud, and logs in again when it has stopped working. A proxy that
+finds the session refused while it runs exits with `SESSION_REJECTED_EXIT`, which is
+what brings it back through `ensure()` instead of leaving it serving failures.
 """
 
 from __future__ import annotations
@@ -59,6 +61,11 @@ class MfaRequiredError(Exception):
 # cloud having a bad moment, and must not be mistaken for one.
 _UNAUTHENTICATED_STATUS = frozenset({401, 403})
 
+# The exit code a proxy uses to say "the cloud stopped accepting the session token". The
+# supervisor reads it as "check the token, renew it if needed, then start me again" rather
+# than as a crash. 3 is free: 0 and 1 are the proxy's own, 2 is argparse's.
+SESSION_REJECTED_EXIT = 3
+
 
 def _http_status(err: BaseException) -> int | None:
     """Dig the HTTP status out of a pyezvizapi error, if it carries one.
@@ -76,6 +83,38 @@ def _http_status(err: BaseException) -> int | None:
             return status
         current = current.__cause__
     return None
+
+
+def session_rejected(err: BaseException) -> bool:
+    """True when `err` says the EZVIZ cloud no longer accepts the session token.
+
+    A proxy holds the token the supervisor gave it at start-up, without the password, and
+    pyezvizapi renews it in memory with the refresh token as long as that one is still
+    good. When it is not, every new stream fails the same way and only a fresh login helps
+    -- which only the supervisor can do. This is what tells the proxy to step aside for it.
+
+    Three shapes reach the proxy, all out of pyezvizapi's own 401 handling:
+
+    - `EzvizAuthTokenExpired`: the renewal itself was refused.
+    - an `HTTPError` raised `from` a 401 or 403: the retries after a renewal ran out.
+    - a plain `PyEzvizError` raised *while handling* a 401 ("Login with account and
+      password required", when the token carries no refresh session): the status is on
+      its `__context__`, not its `__cause__`, so it is read from there.
+
+    Anything else -- a 500, a camera that does not answer, a socket that breaks -- is not
+    evidence about the session, and restarting over it would only interrupt the streams
+    that are working.
+    """
+    if isinstance(err, EzvizAuthTokenExpired):
+        return True
+    if _http_status(err) in _UNAUTHENTICATED_STATUS:
+        return True
+    context = err.__context__
+    return (
+        isinstance(err, PyEzvizError)
+        and context is not None
+        and _http_status(context) in _UNAUTHENTICATED_STATUS
+    )
 
 
 class TokenStore:
@@ -136,6 +175,12 @@ class TokenStore:
         answers a 401 by logging in again by itself and the call would succeed, so
         this would report a dead token as alive and we would go on writing a stale
         file back to disk.
+
+        Without them it can still renew the session through the token's refresh session,
+        and a check that succeeds may have done exactly that. The renewed token is then
+        written back: otherwise every proxy would start on the expired session and renew
+        it again on its own, and once the cloud retires the refresh session they used, the
+        ones that came second would fail for a reason the file no longer shows.
         """
         client = EzvizClient(token=dict(token), url=self._region)
         try:
@@ -156,12 +201,34 @@ class TokenStore:
             )
             return True
         except PyEzvizError as err:
-            # Same reasoning for the non-HTTP failures: a network blip is not evidence
+            # The one non-HTTP failure that is about the session: a renewal refused in a shape
+            # other than EzvizAuthTokenExpired -- a token with no refresh session, answered by
+            # "Login with account and password required". Read as a network blip, it would keep
+            # a dead token forever, and every proxy started on it would fail the same way.
+            if session_rejected(err):
+                return False
+            # Same reasoning for the other non-HTTP failures: a network blip is not evidence
             # that the token is bad.
             _LOGGER.warning("Could not verify the stored token (%s): keeping it.", err)
             return True
         else:
+            self._keep_renewal(token, client)
             return True
+
+    def _keep_renewal(self, stored: dict[str, Any], client: EzvizClient) -> None:
+        """Write the token back when the check renewed the session it was made with.
+
+        Compared on the session alone: the exported token can carry keys the stored one
+        does not, and rewriting the file on every start for those would read in the log
+        like a renewal that never happened.
+        """
+        renewed = client.export_token()
+        if not isinstance(renewed, dict) or not renewed.get("session_id"):
+            return
+        if renewed.get("session_id") == stored.get("session_id"):
+            return
+        self._write(renewed)
+        _LOGGER.info("EZVIZ renewed the session during the token check: stored the new one.")
 
     def _login(self) -> None:
         """Log in with the configured credentials and store the new token."""

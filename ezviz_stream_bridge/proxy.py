@@ -46,7 +46,7 @@ from pyezvizapi.exceptions import DeviceException, PyEzvizError
 
 from .log import configure_logging, level_for
 from .session import DEFAULT_AUDIO_WINDOW, DEFAULT_FIRST_VIDEO_TIMEOUT, CloudSession
-from .token import read_token_file
+from .token import SESSION_REJECTED_EXIT, read_token_file, session_rejected
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -59,6 +59,11 @@ PEER_POLL_INTERVAL = 0.5
 # consumer reconnects would wake it again seconds after it just fell asleep -- the loop
 # that flattens a battery camera. 0 disables the cooldown.
 TIMEOUT_COOLDOWN = 30.0
+
+# How long a proxy that is stepping aside for a new login waits for its other streams to tear
+# down cleanly before it exits anyway. Their FFmpeg and VTM socket die with the process either
+# way; waiting is only so that each one logs its own close line instead of vanishing.
+RESTART_DRAIN = 5.0
 
 
 class ProxyServer(ThreadingHTTPServer):
@@ -101,6 +106,8 @@ class ProxyServer(ThreadingHTTPServer):
         self._ids = itertools.count(1)
         self._active = 0
         self._active_lock = threading.Lock()
+        self._sessions: set[CloudSession] = set()
+        self._restart_requested = False
         super().__init__(address, _ProxyHandler)
 
     def next_id(self) -> int:
@@ -118,6 +125,54 @@ class ProxyServer(ThreadingHTTPServer):
         with self._active_lock:
             self._active -= 1
             return self._active
+
+    def track(self, session: CloudSession) -> None:
+        """Remember a session in flight, so a restart can end it cleanly."""
+        with self._active_lock:
+            self._sessions.add(session)
+
+    def untrack(self, session: CloudSession) -> None:
+        """Forget a session that has finished."""
+        with self._active_lock:
+            self._sessions.discard(session)
+
+    @property
+    def restart_requested(self) -> bool:
+        """True once a handler has found that the cloud no longer accepts the session."""
+        with self._active_lock:
+            return self._restart_requested
+
+    def request_restart(self) -> None:
+        """Stop serving, so the supervisor can renew the session and start this proxy again.
+
+        Called from a handler thread. `shutdown()` blocks until `serve_forever()` has
+        returned, which happens on the main thread, so it is handed to a thread of its own:
+        the handler that asked must still be free to finish and log its close line.
+        Idempotent, because every stream that fails after the session expired asks again.
+        """
+        with self._active_lock:
+            if self._restart_requested:
+                return
+            self._restart_requested = True
+        threading.Thread(target=self.shutdown, name="proxy-restart", daemon=True).start()
+
+    def end_sessions(self, reason: str) -> None:
+        """Abort every session still in flight. Non-blocking: each one tears itself down."""
+        with self._active_lock:
+            sessions = list(self._sessions)
+        for session in sessions:
+            session.abort(reason)
+
+    def wait_idle(self, timeout: float) -> bool:
+        """Wait, at most `timeout` seconds, for every connection to close. True if they did."""
+        deadline = self._now() + timeout
+        while True:
+            with self._active_lock:
+                if self._active <= 0:
+                    return True
+            if self._now() >= deadline:
+                return False
+            self._sleep(min(PEER_POLL_INTERVAL, max(0.0, deadline - self._now())))
 
     def start_cooldown(self) -> None:
         """Begin the post-timeout cooldown, during which no VTM session may open.
@@ -183,6 +238,7 @@ _REASONS = {
     "client gone": "client disconnected",
     "no video": "no video",
     "finished": "stream ended",
+    "session expired": "session expired",
 }
 
 
@@ -200,6 +256,27 @@ def _log_session_event(conn_id: int, event: str, elapsed: float) -> None:
         _LOGGER.info("[VTM]  conn=%d first-video after=%.3fs", conn_id, elapsed)
     elif event == "first-byte":
         _LOGGER.info("[HTTP] conn=%d first-byte after=%.3fs", conn_id, elapsed)
+
+
+def _on_cloud_error(server: ProxyServer, conn_id: int, err: PyEzvizError) -> str:
+    """Log a session that failed in the cloud, and return the reason its close line gives.
+
+    One failure is different from the rest: the cloud no longer accepting the session. Every
+    stream after it would fail the same way, and the fix is a login this process cannot do --
+    it was deliberately given the token and not the password. So it steps aside, and the
+    supervisor renews the session and starts it again.
+    """
+    if not session_rejected(err):
+        _LOGGER.error("[VTM]  conn=%d %s", conn_id, err)
+        return "error"
+    _LOGGER.error(
+        "[VTM]  conn=%d the EZVIZ cloud no longer accepts the session (%s); "
+        "restarting this camera's proxy so the supervisor can log in again",
+        conn_id,
+        err,
+    )
+    server.request_restart()
+    return "session expired"
 
 
 class _ProxyHandler(BaseHTTPRequestHandler):
@@ -239,6 +316,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             connection_id=conn_id,
             on_event=lambda event, elapsed: _log_session_event(conn_id, event, elapsed),
         )
+        server.track(session)
         stop_watching = threading.Event()
         watcher: threading.Thread | None = None
 
@@ -267,7 +345,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             # wait out the cooldown first, unless the consumer is already gone.
             server.wait_for_cooldown(session)
             if session.abort_reason is not None:
-                reason = "client disconnected"
+                reason = _REASONS.get(session.abort_reason, "client disconnected")
             else:
                 _LOGGER.info("[VTM]  conn=%d session opening", conn_id)
                 session.run(cast(BinaryIO, self.wfile))
@@ -288,9 +366,9 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                     server.timeout_cooldown,
                 )
         except PyEzvizError as err:
-            reason = "error"
-            _LOGGER.error("[VTM]  conn=%d %s", conn_id, err)
+            reason = _on_cloud_error(server, conn_id, err)
         finally:
+            server.untrack(session)
             stop_watching.set()
             if watcher is not None:
                 watcher.join(timeout=PEER_POLL_INTERVAL * 4)
@@ -439,7 +517,20 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         server.shutdown()
         server.server_close()
-    return 0
+
+    if not server.restart_requested:
+        return 0
+
+    # The listening socket is closed, so no new stream can start on the dead session. The ones
+    # already running are ended here rather than by the exit, so each logs how it closed.
+    server.end_sessions("session expired")
+    if not server.wait_idle(RESTART_DRAIN):
+        _LOGGER.warning(
+            "Proxy for %s: streams still open after %.0fs; exiting anyway.",
+            args.serial,
+            RESTART_DRAIN,
+        )
+    return SESSION_REJECTED_EXIT
 
 
 if __name__ == "__main__":
