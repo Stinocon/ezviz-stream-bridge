@@ -55,7 +55,7 @@ jobs:
       - name: Lint
         id: lint
         shell: bash
-        run: .venv/bin/ruff check --output-format=concise . 2>&1 | tee lint.log
+        run: set -o pipefail; .venv/bin/ruff check --output-format=concise . 2>&1 | tee lint.log
 
       # Runs even when the lint failed: the two answer different questions, and a red lint should
       # not hide whether the behaviour still holds.
@@ -63,7 +63,7 @@ jobs:
         id: tests
         if: ${{ !cancelled() }}
         shell: bash
-        run: .venv/bin/python -m pytest -q -rs 2>&1 | tee pytest.log
+        run: set -o pipefail; .venv/bin/python -m pytest -q -rs 2>&1 | tee pytest.log
 
       - name: Write the failure report
         if: ${{ failure() }}

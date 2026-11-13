@@ -285,6 +285,10 @@ pytest
 ruff check .
 ```
 
+GitHub Actions runs the same lint and test gates on every pull request and push to `main`. The
+logs are retained in the Actions run, and a failing run comments on its pull request or opens an
+issue for `main`.
+
 The RTP and MPEG-PS paths are verified against the FFmpeg the add-on actually runs, not the one
 on a development machine: the image installs Debian's, and a remux that worked on a laptop has
 failed inside the container before. The script builds synthetic H.264, HEVC and AAC streams,
