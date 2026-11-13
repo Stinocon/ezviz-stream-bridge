@@ -26,9 +26,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # Only for the failure report below, which is posted on the pull request so the reason a
-      # check went red can be read without opening the Actions log.
+      # Only for the failure reports below: a comment on the pull request, or one issue for main,
+      # so the reason a check went red can be read without opening the Actions log.
       pull-requests: write
+      issues: write
     steps:
       - name: Checkout the repository
         uses: actions/checkout@v5
@@ -64,20 +65,17 @@ jobs:
         shell: bash
         run: .venv/bin/python -m pytest -q -rs 2>&1 | tee pytest.log
 
-      - name: Report the failure on the pull request
-        if: >-
-          ${{ failure() && github.event_name == 'pull_request'
-          && github.event.pull_request.head.repo.full_name == github.repository }}
+      - name: Write the failure report
+        if: ${{ failure() }}
         env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         shell: bash
         run: |
           {
             echo "### Tests failed on ${HEAD_SHA::7}"
             echo
             echo "Lint: ${{ steps.lint.outcome }} · Tests: ${{ steps.tests.outcome }}"
+            echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             for log in lint.log pytest.log; do
               [ -s "${log}" ] || continue
               echo
@@ -89,4 +87,43 @@ jobs:
               echo "</details>"
             done
           } > report.md
-          gh pr comment "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --body-file report.md
+
+      - name: Report the failure on the pull request
+        if: >-
+          ${{ failure() && github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name == github.repository }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: gh pr comment "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --body-file report.md
+
+      # Changes also land on main directly, and a red run there would otherwise be visible only
+      # in the Actions tab. One issue, reused while main stays red and closed by the first green
+      # run after it, so the state of main can be read from the issue list.
+      - name: Report the failure on main
+        if: ${{ failure() && github.event_name == 'push' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          open=$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open \
+              --search '"Tests failing on main" in:title' --json number --jq '.[0].number // empty')
+          if [ -n "${open}" ]; then
+              gh issue comment "${open}" --repo "${GITHUB_REPOSITORY}" --body-file report.md
+          else
+              gh issue create --repo "${GITHUB_REPOSITORY}" --title "Tests failing on main" \
+                  --body-file report.md
+          fi
+
+      - name: Close the failure issue once main is green
+        if: ${{ success() && github.event_name == 'push' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          for number in $(gh issue list --repo "${GITHUB_REPOSITORY}" --state open \
+              --search '"Tests failing on main" in:title' --json number --jq '.[].number'); do
+              gh issue close "${number}" --repo "${GITHUB_REPOSITORY}" \
+                  --comment "Green again on ${GITHUB_SHA::7}."
+          done
