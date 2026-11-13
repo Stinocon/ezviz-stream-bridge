@@ -160,3 +160,31 @@ def test_an_empty_audio_window_means_unset(value: object) -> None:
 def test_a_bad_audio_window_names_the_option(value: object) -> None:
     with pytest.raises(ConfigError, match="audio_window"):
         BridgeConfig.from_options(_options(audio_window=value))
+
+
+# -- the two waits the proxy already had, now reachable from the add-on ---------------------------
+
+DURATION_OPTIONS = ("first_video_timeout", "timeout_cooldown")
+
+
+@pytest.mark.parametrize("option", DURATION_OPTIONS)
+def test_a_wait_is_unset_unless_the_option_is_given(option: str) -> None:
+    """Unset, the proxy's own default applies: the add-on declares these optional precisely so
+    that the number has one home."""
+    assert getattr(BridgeConfig.from_options(_options()), option) is None
+    assert getattr(BridgeConfig.from_options(_options(**{option: ""})), option) is None
+
+
+@pytest.mark.parametrize("option", DURATION_OPTIONS)
+@pytest.mark.parametrize("value", [0, 12.5, "40"])
+def test_a_wait_is_read_when_set(option: str, value: object) -> None:
+    config = BridgeConfig.from_options(_options(**{option: value}))
+
+    assert getattr(config, option) == float(value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("option", DURATION_OPTIONS)
+@pytest.mark.parametrize("value", [-1, "soon", "nan", "inf"])
+def test_a_bad_wait_names_its_option(option: str, value: object) -> None:
+    with pytest.raises(ConfigError, match=option):
+        BridgeConfig.from_options(_options(**{option: value}))

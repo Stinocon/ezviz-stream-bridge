@@ -232,6 +232,12 @@ ezviz-stream-bridge --options ./options.json --token-file ./ezviz_token.json
 }
 ```
 
+Two more keys are optional and left out above, because their defaults live in the proxy:
+`first_video_timeout` (seconds a session waits for the camera's first video packet, 25 by
+default, `0` waits indefinitely) and `timeout_cooldown` (seconds a new session is withheld after
+a camera timeout, 30 by default, `0` disables it). They are the proxy's `--first-video-timeout`
+and `--timeout-cooldown`, passed through only when set.
+
 `serial` is the device serial, **not** the six-letter verification code printed on the camera.
 The easiest way to find it is to fill in the credentials, leave `serial` empty and start once:
 the run fails, and the log then lists every camera on the account with its serial. It is also in

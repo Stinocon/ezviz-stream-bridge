@@ -95,7 +95,7 @@ class _FakeProcess:
 
 
 def _supervisor(
-    *, log_ffmpeg_stderr: bool = False, audio_window: float | None = None
+    *, log_ffmpeg_stderr: bool = False, audio_window: float | None = None, **waits: float
 ) -> Supervisor:
     options: dict[str, object] = {
         "username": "user@example.com",
@@ -103,6 +103,7 @@ def _supervisor(
         "region": "apiieu.ezvizlife.com",
         "cameras": [{"serial": "BB1234567", "port": 8558}],
         "log_ffmpeg_stderr": log_ffmpeg_stderr,
+        **waits,
     }
     if audio_window is not None:
         options["audio_window"] = audio_window
@@ -223,3 +224,27 @@ def test_the_restart_after_an_expired_session_goes_through_the_token_check(
 
     assert checks == [1]
     assert proxy.running
+
+
+@pytest.mark.parametrize(
+    ("option", "flag"),
+    [("first_video_timeout", "--first-video-timeout"), ("timeout_cooldown", "--timeout-cooldown")],
+)
+def test_a_wait_reaches_the_proxy_only_when_it_is_set(
+    monkeypatch: pytest.MonkeyPatch, option: str, flag: str
+) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fake_popen(command: list[str]) -> _FakeProcess:
+        captured["command"] = command
+        return _FakeProcess()
+
+    monkeypatch.setattr(supervisor_module.subprocess, "Popen", fake_popen)
+    unset = _supervisor()
+    unset._start(unset._proxies[0])
+    assert flag not in captured["command"]
+
+    passed = _supervisor(**{option: 45.0})
+    passed._start(passed._proxies[0])
+    command = captured["command"]
+    assert command[command.index(flag) + 1] == "45"

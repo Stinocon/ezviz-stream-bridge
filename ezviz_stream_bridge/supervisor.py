@@ -280,6 +280,10 @@ class Supervisor:
         # would turn the add-on into a second place the number lives.
         if self._config.audio_window is not None:
             command += ["--audio-window", f"{self._config.audio_window:g}"]
+        if self._config.first_video_timeout is not None:
+            command += ["--first-video-timeout", f"{self._config.first_video_timeout:g}"]
+        if self._config.timeout_cooldown is not None:
+            command += ["--timeout-cooldown", f"{self._config.timeout_cooldown:g}"]
 
         try:
             # stdout/stderr are inherited so the proxy's own messages land in the
