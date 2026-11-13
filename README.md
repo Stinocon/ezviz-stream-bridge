@@ -40,7 +40,10 @@ full measured account of why, so nobody has to repeat the work.
   from there.
 - **Video encryption off** for the camera. Encrypted video needs the camera's media key, and
   the cloud only releases it to a rights-elevated session — the request returns
-  `resultCode 20002` and emails a code, which again nobody is there to read.
+  `resultCode 20002` and emails a code, which again nobody is there to read. An HEVC camera
+  that still has it on is recognised by its parameter sets, which keep their NAL headers and
+  read as noise after them: the session then says so, naming the setting, and caches nothing
+  (`hevc.py`).
 
 The camera's six-letter verification code is **not** needed and is not the account password.
 
@@ -205,7 +208,11 @@ This project is the part that has to keep working for weeks unattended:
   and a wrong guess there sends the whole diagnosis down the wrong path.
 - **Session handling in one place.** The token is verified before every proxy start and renewed
   when the cloud stops accepting it. It is kept on `/data`, because a fresh login on every
-  start is a login EZVIZ counts and rate-limits.
+  start is a login EZVIZ counts and rate-limits. A proxy that finds the session refused while
+  it is running — the library's own renewal turned down — ends its streams, logs
+  `reason='session expired'` and exits with code 3; the supervisor reads that as "log in
+  again", not as a crash, and starts it back through the same token check. Before 0.1.18 such
+  a proxy kept failing every stream until the add-on was restarted by hand.
 - **The password never reaches a command line.** The login happens in-process and the proxies
   receive only a token file, so the credential stays out of the process table.
 - **Two-factor accounts are reported, not retried.** Nothing in a container can type a code in,
