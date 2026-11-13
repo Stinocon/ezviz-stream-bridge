@@ -202,7 +202,7 @@ def client(monkeypatch: pytest.MonkeyPatch) -> type[_Client]:
 
 def _store(path: Path, session_id: str = "old") -> TokenStore:
     path.write_text(json.dumps({"session_id": session_id, "rf_session_id": "rf"}))
-    return TokenStore(path, username="user@example.com", password="secret", region="apiieu")
+    return TokenStore(path, username="user@example.com", password="secret", region="apiieu")  # noqa: S106 - a test credential
 
 
 def test_a_session_renewed_during_the_check_is_written_back(

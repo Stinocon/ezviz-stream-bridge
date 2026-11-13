@@ -258,6 +258,24 @@ def _log_session_event(conn_id: int, event: str, elapsed: float) -> None:
         _LOGGER.info("[HTTP] conn=%d first-byte after=%.3fs", conn_id, elapsed)
 
 
+def _on_camera_timeout(server: ProxyServer, conn_id: int, err: DeviceException) -> str:
+    """Log a camera that did not deliver in time, arm the cooldown, and name the close reason.
+
+    Asleep, or waking slowly: expected for a battery doorbell, and the consumer will retry with
+    a fresh GET -- which is what the cooldown holds back, so the camera is not woken again the
+    instant it has fallen asleep.
+    """
+    server.start_cooldown()
+    _LOGGER.warning("[VTM]  conn=%d %s", conn_id, err)
+    if server.timeout_cooldown > 0:
+        _LOGGER.info(
+            "[VTM]  conn=%d camera went offline mid-stream; next wake delayed %.0fs",
+            conn_id,
+            server.timeout_cooldown,
+        )
+    return "camera timeout"
+
+
 def _on_cloud_error(server: ProxyServer, conn_id: int, err: PyEzvizError) -> str:
     """Log a session that failed in the cloud, and return the reason its close line gives.
 
@@ -353,18 +371,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             reason = "client disconnected"
         except DeviceException as err:
-            # The camera did not deliver in time -- asleep, or waking slowly. Expected
-            # for a battery doorbell; the consumer will retry with a fresh GET.
-            reason = "camera timeout"
-            server.start_cooldown()
-            _LOGGER.warning("[VTM]  conn=%d %s", conn_id, err)
-            if server.timeout_cooldown > 0:
-                _LOGGER.info(
-                    "[VTM]  conn=%d camera went offline mid-stream; "
-                    "next wake delayed %.0fs",
-                    conn_id,
-                    server.timeout_cooldown,
-                )
+            reason = _on_camera_timeout(server, conn_id, err)
         except PyEzvizError as err:
             reason = _on_cloud_error(server, conn_id, err)
         finally:

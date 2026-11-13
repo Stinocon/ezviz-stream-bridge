@@ -30,7 +30,7 @@ _MAX_DIMENSION = 16888
 _MAX_UE_LEADING_ZEROS = 31
 
 
-class UnreadableParameterSet(ValueError):
+class UnreadableParameterSetError(ValueError):
     """A parameter set a decoder would refuse. The message names the field."""
 
 
@@ -72,7 +72,7 @@ def rbsp(unit: bytes) -> bytes:
 
 
 class _Bits:
-    """MSB-first reader over an RBSP, raising `UnreadableParameterSet` past its end."""
+    """MSB-first reader over an RBSP, raising `UnreadableParameterSetError` past its end."""
 
     def __init__(self, data: bytes, what: str) -> None:
         self._data = data
@@ -81,7 +81,7 @@ class _Bits:
 
     def u(self, count: int) -> int:
         if self._position + count > len(self._data) * 8:
-            raise UnreadableParameterSet(f"{self._what} ends before its fields do")
+            raise UnreadableParameterSetError(f"{self._what} ends before its fields do")
         value = 0
         for _ in range(count):
             byte = self._data[self._position >> 3]
@@ -91,7 +91,7 @@ class _Bits:
 
     def skip(self, count: int) -> None:
         if self._position + count > len(self._data) * 8:
-            raise UnreadableParameterSet(f"{self._what} ends before its fields do")
+            raise UnreadableParameterSetError(f"{self._what} ends before its fields do")
         self._position += count
 
     def ue(self) -> int:
@@ -99,7 +99,7 @@ class _Bits:
         while self.u(1) == 0:
             zeros += 1
             if zeros > _MAX_UE_LEADING_ZEROS:
-                raise UnreadableParameterSet(f"{self._what} holds a number no field can have")
+                raise UnreadableParameterSetError(f"{self._what} holds a number no field can have")
         return (1 << zeros) - 1 + self.u(zeros)
 
 
@@ -108,13 +108,15 @@ def read_vps(unit: bytes) -> Vps:
     bits = _Bits(rbsp(unit), "VPS")
     vps_id = bits.u(4)
     if bits.u(2) != 3:
-        raise UnreadableParameterSet("VPS reserved bits are not 11 (vps_reserved_three_2bits)")
+        raise UnreadableParameterSetError("VPS reserved bits are not 11 (vps_reserved_three_2bits)")
     bits.skip(6)  # vps_max_layers_minus1
     if bits.u(3) > 6:
-        raise UnreadableParameterSet("VPS declares more than seven temporal sub-layers")
+        raise UnreadableParameterSetError("VPS declares more than seven temporal sub-layers")
     bits.skip(1)  # vps_temporal_id_nesting_flag
     if bits.u(16) != 0xFFFF:
-        raise UnreadableParameterSet("VPS reserved bits are not ffff (vps_reserved_0xffff_16bits)")
+        raise UnreadableParameterSetError(
+            "VPS reserved bits are not ffff (vps_reserved_0xffff_16bits)"
+        )
     return Vps(vps_id)
 
 
@@ -142,21 +144,23 @@ def read_sps(unit: bytes) -> Sps:
     vps_id = bits.u(4)
     max_sub_layers_minus1 = bits.u(3)
     if max_sub_layers_minus1 > 6:
-        raise UnreadableParameterSet("SPS declares more than seven temporal sub-layers")
+        raise UnreadableParameterSetError("SPS declares more than seven temporal sub-layers")
     bits.skip(1)  # sps_temporal_id_nesting_flag
     _skip_profile_tier_level(bits, max_sub_layers_minus1)
     sps_id = bits.ue()
     if sps_id > 15:
-        raise UnreadableParameterSet(f"SPS id {sps_id} is out of range")
+        raise UnreadableParameterSetError(f"SPS id {sps_id} is out of range")
     chroma_format_idc = bits.ue()
     if chroma_format_idc > 3:
-        raise UnreadableParameterSet(f"SPS chroma format {chroma_format_idc} does not exist")
+        raise UnreadableParameterSetError(f"SPS chroma format {chroma_format_idc} does not exist")
     if chroma_format_idc == 3:
         bits.skip(1)  # separate_colour_plane_flag
     width = bits.ue()
     height = bits.ue()
     if not (0 < width <= _MAX_DIMENSION and 0 < height <= _MAX_DIMENSION):
-        raise UnreadableParameterSet(f"SPS picture size {width}x{height} is not a picture size")
+        raise UnreadableParameterSetError(
+            f"SPS picture size {width}x{height} is not a picture size"
+        )
     return Sps(sps_id, vps_id, width, height)
 
 
@@ -165,10 +169,10 @@ def read_pps(unit: bytes) -> Pps:
     bits = _Bits(rbsp(unit), "PPS")
     pps_id = bits.ue()
     if pps_id > 63:
-        raise UnreadableParameterSet(f"PPS id {pps_id} is out of range")
+        raise UnreadableParameterSetError(f"PPS id {pps_id} is out of range")
     sps_id = bits.ue()
     if sps_id > 15:
-        raise UnreadableParameterSet(f"PPS names SPS {sps_id}, which is out of range")
+        raise UnreadableParameterSetError(f"PPS names SPS {sps_id}, which is out of range")
     return Pps(pps_id, sps_id)
 
 
@@ -179,7 +183,7 @@ def unit_problem(kind: str, unit: bytes) -> str | None:
     """Why one parameter set of `kind` ("vps", "sps" or "pps") is unusable, or None if it reads."""
     try:
         _READERS[kind](unit)
-    except UnreadableParameterSet as err:
+    except UnreadableParameterSetError as err:
         return str(err)
     return None
 
@@ -197,7 +201,7 @@ def sets_problem(
         vps_ids = {read_vps(unit).vps_id for unit in vps}
         sps_read = [read_sps(unit) for unit in sps]
         pps_read = [read_pps(unit) for unit in pps]
-    except UnreadableParameterSet as err:
+    except UnreadableParameterSetError as err:
         return str(err)
     if not (vps_ids and sps_read and pps_read):
         return "VPS, SPS and PPS are not all there"

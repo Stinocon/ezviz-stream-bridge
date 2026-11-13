@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from ezviz_stream_bridge.hevc import (
-    UnreadableParameterSet,
+    UnreadableParameterSetError,
     rbsp,
     read_pps,
     read_sps,
@@ -58,19 +58,19 @@ def test_the_vps_reserved_bits_are_checked_where_ffmpeg_checks_them() -> None:
     """`vps_reserved_three_2bits is not three`, the first line of the issue's log."""
     body = bytearray(rbsp(VPS))
     body[0] &= 0b11110011
-    with pytest.raises(UnreadableParameterSet, match="vps_reserved_three_2bits"):
+    with pytest.raises(UnreadableParameterSetError, match="vps_reserved_three_2bits"):
         read_vps(_with_body(VPS, bytes(body)))
 
     body = bytearray(rbsp(VPS))
     body[2] = 0x7F
-    with pytest.raises(UnreadableParameterSet, match="ffff"):
+    with pytest.raises(UnreadableParameterSetError, match="ffff"):
         read_vps(_with_body(VPS, bytes(body)))
 
 
 def test_an_out_of_range_pps_id_is_refused() -> None:
     """`PPS id out of range`: ue(v) 64 is six zeros, a one and 000001; then SPS 0 and the stop
     bit."""
-    with pytest.raises(UnreadableParameterSet, match="PPS id 64"):
+    with pytest.raises(UnreadableParameterSetError, match="PPS id 64"):
         read_pps(b"\x44\x01" + bytes((0b00000010, 0b00001110)))
 
 
