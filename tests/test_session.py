@@ -86,6 +86,14 @@ START_CODE = b"\x00\x00\x00\x01"
 # whose subject is not the RTP path.
 PS_PACKET = b"\x00\x00\x01\xba" + b"data"
 
+# Real HEVC parameter sets (libx265, 160x90): the program-stream inspector keeps only units that
+# read as what they claim to be, so a cache test needs sets a decoder would accept.
+HEVC_VPS = bytes.fromhex("40010c01ffff01600000030090000003000003001e959809")
+HEVC_SPS = bytes.fromhex(
+    "42010101600000030090000003000003001ea0142061f265959a4932bc05a020000003002000000300a1"
+)
+HEVC_PPS = bytes.fromhex("4401c172b46240")
+
 # The H.264 SPS of the reported session, and the payload that names the codec.
 SPS_PAYLOAD = b"\x67\x4d\x00\x32\x8d\x8d\x40\x14"
 
@@ -707,7 +715,7 @@ def test_mpeg_ps_mid_gop_join_gets_cached_hevc_sets(vtm, fake_ffmpeg, caplog) ->
     caplog.set_level(logging.INFO)
     pack = bytes.fromhex("000001ba2100010001c33367")
     start = b"\x00\x00\x01"
-    vps, sps, pps = b"\x40\x01\x0c\x01", b"\x42\x01\x01", b"\x44\x01\xc0"
+    vps, sps, pps = HEVC_VPS, HEVC_SPS, HEVC_PPS
 
     def pes(payload: bytes) -> bytes:
         return start + b"\xe0" + (len(payload) + 3).to_bytes(2, "big") + b"\x80\x00\x00" + payload
@@ -737,6 +745,76 @@ def test_mpeg_ps_mid_gop_join_gets_cached_hevc_sets(vtm, fake_ffmpeg, caplog) ->
     cached = session_module._PS_PARAMETER_SETS["PS1234567"]
     assert bytes(sink.data) == make_prelude(cached) + joined
     assert any("MPEG-PS joined mid-GOP" in record.getMessage() for record in caplog.records)
+
+
+def test_mpeg_ps_sets_that_do_not_read_are_named_and_never_cached(
+    vtm, fake_ffmpeg, caplog
+) -> None:
+    """Issue #2, the BC1C: a camera with video encryption on keeps each NAL header and encrypts
+    the rest, so its VPS/SPS/PPS still look like parameter sets from the outside. 0.1.17 cached
+    them and handed them to every join; FFmpeg refused them each time. Now the session says
+    what that usually means, once, and the next join gets nothing rather than the same noise."""
+    caplog.set_level(logging.INFO)
+    pack = bytes.fromhex("000001ba2100010001c33367")
+    start = b"\x00\x00\x01"
+
+    def pes(payload: bytes) -> bytes:
+        return start + b"\xe0" + (len(payload) + 3).to_bytes(2, "big") + b"\x80\x00\x00" + payload
+
+    def scrambled(unit: bytes) -> bytes:
+        return unit[:2] + bytes((index * 151 + 89) & 0xFF for index in range(len(unit) - 2))
+
+    opened = pack + pes(
+        b"".join(start + scrambled(unit) for unit in (HEVC_VPS, HEVC_SPS, HEVC_PPS))
+        + start
+        + b"\x26\x01\x80"
+    )
+    vtm([video(opened), video(opened)], silent_after=False)
+    first = CloudSession(object(), "PS7654321", ffmpeg_path=fake_ffmpeg, first_video_timeout=0)
+    thread, errors = run_in_thread(first, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert "PS7654321" not in session_module._PS_PARAMETER_SETS
+    warnings = [r.getMessage() for r in caplog.records if "do not read" in r.getMessage()]
+    assert len(warnings) == 1, warnings
+    assert "Video Encryption" in warnings[0]
+
+    joined = pack + pes(start + b"\x02\x01\x80")
+    vtm([video(joined)], silent_after=False)
+    second = CloudSession(object(), "PS7654321", ffmpeg_path=fake_ffmpeg, first_video_timeout=0)
+    sink = Sink()
+    thread, errors = run_in_thread(second, sink)
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert errors == []
+    assert bytes(sink.data) == joined
+
+
+def test_mpeg_ps_readable_sets_later_in_the_stream_still_warm_the_cache(
+    vtm, fake_ffmpeg, caplog
+) -> None:
+    """The warning is about a stream whose sets never read. One unreadable unit followed by
+    sets that do is not that stream, and the cache must still be warmed from it."""
+    caplog.set_level(logging.INFO)
+    pack = bytes.fromhex("000001ba2100010001c33367")
+    start = b"\x00\x00\x01"
+
+    def pes(payload: bytes) -> bytes:
+        return start + b"\xe0" + (len(payload) + 3).to_bytes(2, "big") + b"\x80\x00\x00" + payload
+
+    readable = pack + pes(
+        b"".join(start + unit for unit in (HEVC_VPS, HEVC_SPS, HEVC_PPS, b"\x26\x01\x80"))
+    )
+    vtm([video(pack + pes(start + b"\x02\x01\x80"))] * 8 + [video(readable)], silent_after=False)
+    session = CloudSession(object(), "PS1111111", ffmpeg_path=fake_ffmpeg, first_video_timeout=0)
+    thread, errors = run_in_thread(session, Sink())
+    thread.join(timeout=TEARDOWN_LIMIT)
+
+    assert errors == []
+    assert session_module._PS_PARAMETER_SETS["PS1111111"].complete
+    assert not any("do not read" in r.getMessage() for r in caplog.records)
 
 
 def test_classify_payload_recognises_mpeg_ps_at_any_offset() -> None:

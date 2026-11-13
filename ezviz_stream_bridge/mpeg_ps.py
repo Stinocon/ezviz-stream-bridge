@@ -2,6 +2,10 @@
 
 The bridge otherwise leaves program streams to FFmpeg. This reader only walks pack and PES
 boundaries, then inspects video elementary-stream NAL units; it does not rewrite source packets.
+
+A unit is kept only once it reads as the parameter set it claims to be (see `hevc.py`). The
+ones that do not are counted instead, because a stream whose parameter sets are all unreadable
+is the signature of a camera with video encryption on, and that is worth saying in the log.
 """
 
 # Protocol field values below stay next to the bit tests that use them.
@@ -10,6 +14,8 @@ boundaries, then inspects video elementary-stream NAL units; it does not rewrite
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from .hevc import sets_problem, unit_problem
 
 _START = b"\x00\x00\x01"
 _PACK = 0xBA
@@ -76,6 +82,20 @@ class ProgramStreamInspector:
         self._video_stream_id: int | None = None
         self._elementary = bytearray()
         self._sets: dict[str, list[bytes]] = {name: [] for name in _HEVC_TYPES.values()}
+        # Whether the sets kept so far open a stream together; None until they are read again.
+        self._usable: bool | None = None
+        self._rejected = 0
+        self._rejection: str | None = None
+
+    @property
+    def rejected(self) -> int:
+        """How many parameter-set NAL units were seen and refused as unreadable."""
+        return self._rejected
+
+    @property
+    def rejection(self) -> str | None:
+        """Why the first refused unit was refused, naming the field; None if none was."""
+        return self._rejection
 
     def feed(self, data: bytes) -> ParameterSets | None:
         self._pending.extend(data)
@@ -88,9 +108,15 @@ class ProgramStreamInspector:
 
     @property
     def complete(self) -> bool:
-        return all(self._sets[name] for name in _HEVC_TYPES.values()) and bool(
-            self._pack_header
-        )
+        """True once a VPS, an SPS and a PPS that open a stream together have been seen."""
+        if not (self._pack_header and all(self._sets[name] for name in _HEVC_TYPES.values())):
+            return False
+        if self._usable is None:
+            # Each unit already reads on its own; what is left is that the references resolve
+            # -- an SPS naming a VPS that has not arrived yet is not a set to hand over.
+            problem = sets_problem(self._sets["vps"], self._sets["sps"], self._sets["pps"])
+            self._usable = problem is None
+        return self._usable
 
     def snapshot(self) -> ParameterSets | None:
         if not self.complete or self._video_stream_id is None:
@@ -194,6 +220,12 @@ class ProgramStreamInspector:
         kind = (unit[0] >> 1) & 0x3F
         name = _HEVC_TYPES.get(kind)
         if name and len(unit) <= _MAX_PARAMETER_SET:
+            problem = unit_problem(name, unit)
+            if problem is not None:
+                self._rejected += 1
+                if self._rejection is None:
+                    self._rejection = problem
+                return
             group = self._sets[name]
             cached_size = sum(len(item) for values in self._sets.values() for item in values)
             if (
@@ -202,6 +234,7 @@ class ProgramStreamInspector:
                 and cached_size + len(unit) <= _MAX_PARAMETER_SETS_BYTES
             ):
                 group.append(unit)
+                self._usable = None
 
 
 def _pes_payload(packet: bytes) -> bytes:  # noqa: PLR2004 - PES field values are protocol constants

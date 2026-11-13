@@ -746,6 +746,8 @@ class CloudSession:
         # Seconds into the session at which the audio input was given up as stalled, or None.
         self._audio_ended_at: float | None = None
         self._writer_error: Exception | None = None
+        # Set once the unreadable-parameter-set warning has been logged for this session.
+        self._warned_unreadable_sets = False
         # One `_MediaSpan` per payload type that carried media. Recorded for every type, not only
         # the one being served: a window that turned out to be too short is corrected from this,
         # and the span is what a packet rate is measured from.
@@ -1274,6 +1276,12 @@ class CloudSession:
         if current is not None:
             self._remember_ps_parameter_sets(current)
             return _PayloadPlan("MPEG_PS", _MPEG_PS_DEMUXER, None, None, packets)
+        if inspector.rejected:
+            # The camera sent parameter sets, and none of them read. Cached sets from an
+            # earlier session would not help: the camera's own come after them in the stream,
+            # under the same ids, and the slices they describe are as unreadable as they are.
+            self._warn_unreadable_parameter_sets(inspector)
+            return _PayloadPlan("MPEG_PS", _MPEG_PS_DEMUXER, None, None, packets)
         cached_ps = self._cached_ps_parameter_sets()
         if cached_ps is not None:
             prelude = make_ps_prelude(cached_ps)
@@ -1339,6 +1347,29 @@ class CloudSession:
             sets = inspector.feed(body)
             if sets is not None:
                 self._remember_ps_parameter_sets(sets)
+        if inspector.rejected and not inspector.complete:
+            self._warn_unreadable_parameter_sets(inspector)
+
+    def _warn_unreadable_parameter_sets(self, inspector: ProgramStreamInspector) -> None:
+        """Say, once per session, that the camera's HEVC parameter sets do not read, and why.
+
+        The FFmpeg errors this replaces as the first thing in the log -- `VPS 6 does not
+        exist`, `PPS id out of range` -- name the symptom and not the cause, and the cause is
+        nearly always one setting on the camera. The sets are not cached either: handing them
+        to the next join would only repeat the failure there.
+        """
+        if self._warned_unreadable_sets:
+            return
+        self._warned_unreadable_sets = True
+        _LOGGER.warning(
+            "[FFmpeg] %sthe camera's HEVC parameter sets do not read (%d refused, first: %s), "
+            "so FFmpeg cannot decode this stream and they are not cached. That is what a "
+            "camera with Video Encryption on sends: turn it off for this camera in the EZVIZ "
+            "app and open the stream again",
+            self._label(),
+            inspector.rejected,
+            inspector.rejection,
+        )
 
     def _accept(self, packet: Any) -> bytes | None:
         """Check one VTM packet, and return its body when it is video.

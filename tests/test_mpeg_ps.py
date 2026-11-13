@@ -8,9 +8,19 @@ import pytest
 from ezviz_stream_bridge.mpeg_ps import ProgramStreamInspector, make_prelude
 
 PACK = bytes.fromhex("000001ba2100010001c33367")
-VPS = bytes.fromhex("40010c01")
-SPS = bytes.fromhex("420101")
-PPS = bytes.fromhex("4401c0")
+# Real parameter sets, out of libx265 for a 160x90 picture: the inspector keeps only units that
+# read as what they claim to be, so the fixtures have to be ones a decoder would accept.
+VPS = bytes.fromhex("40010c01ffff01600000030090000003000003001e959809")
+SPS = bytes.fromhex(
+    "42010101600000030090000003000003001ea0142061f265959a4932bc05a020000003002000000300a1"
+)
+PPS = bytes.fromhex("4401c172b46240")
+# The same encoder at 1920x1080, and the PPS above renumbered as PPS 1: distinct units of the
+# same types, each still valid.
+SPS_1080 = bytes.fromhex(
+    "420101016000000300900000030000030078a003c08010e596566924caf0168080000003008000000c84"
+)
+PPS_1 = bytes.fromhex("4401505cad1890")
 START = b"\x00\x00\x01"
 
 
@@ -69,7 +79,7 @@ def test_inspector_reads_mpeg2_pack_and_pts_bearing_pes_headers() -> None:
 
 
 def test_inspector_keeps_distinct_parameter_sets_of_the_same_type() -> None:
-    second_sps, second_pps = b"\x42\x01\x02", b"\x44\x01\xc1"
+    second_sps, second_pps = SPS_1080, PPS_1
     elementary = b"".join(
         b"\x00\x00\x01" + unit
         for unit in (VPS, SPS, second_sps, PPS, second_pps, b"\x26\x01\x80")
@@ -200,3 +210,53 @@ def test_ffmpeg_decodes_a_real_hevc_program_stream_after_prelude_injection() -> 
     assert b"codec_name=hevc" in probed.stdout
     assert b"codec_name=mp2" in probed.stdout
     assert b"width=160" in probed.stdout and b"height=90" in probed.stdout
+
+
+# -- parameter sets that do not read -----------------------------------------------------------
+#
+# Issue #2: a camera with video encryption on keeps each NAL header and encrypts what follows.
+# The inspector used to keep such units on their header alone, the session cached them, and
+# every join was handed sets FFmpeg refuses. Now they are counted and refused.
+
+
+def _scrambled(unit: bytes) -> bytes:
+    """`unit` with its header kept and its body replaced, the way encryption leaves it."""
+    return unit[:2] + bytes((index * 151 + 89) & 0xFF for index in range(len(unit) - 2))
+
+
+def test_parameter_sets_that_do_not_read_are_refused_and_counted() -> None:
+    inspector = ProgramStreamInspector()
+    elementary = b"".join(START + _scrambled(unit) for unit in (VPS, SPS, PPS, b"\x26\x01\x80"))
+
+    inspector.feed(PACK + _pes(elementary))
+
+    assert inspector.snapshot() is None
+    assert inspector.flush() is None
+    assert inspector.rejected >= 1
+    assert inspector.rejection is not None and "VPS" in inspector.rejection
+
+
+def test_the_old_placeholder_sets_are_exactly_what_a_decoder_refuses() -> None:
+    """The fixtures 0.1.17 was tested with announce the right NAL types and carry none of the
+    fields, which is how a test passed against sets FFmpeg would never open."""
+    placeholders = (b"\x40\x01\x0c\x01", b"\x42\x01\x01", b"\x44\x01\xc0")
+    inspector = ProgramStreamInspector()
+
+    inspector.feed(PACK + _pes(b"".join(START + unit for unit in placeholders)))
+
+    assert inspector.flush() is None
+    assert inspector.rejected == 2  # the VPS and the SPS; that PPS happens to read
+
+
+def test_sets_whose_references_do_not_resolve_are_not_complete() -> None:
+    """A PPS naming an SPS the stream has not sent is the `SPS 0 does not exist` of the issue:
+    the set is not handed over until the SPS it names has arrived."""
+    inspector = ProgramStreamInspector()
+    inspector.feed(PACK + _pes(b"".join(START + unit for unit in (VPS, PPS))))
+    assert inspector.snapshot() is None
+
+    inspector.feed(PACK + _pes(START + SPS + START + b"\x26\x01\x80"))
+
+    sets = inspector.snapshot()
+    assert sets is not None and sets.complete
+    assert inspector.rejected == 0
